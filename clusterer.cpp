@@ -30,7 +30,7 @@ void Clusterer::run() {
   spdlog::info("Clustering {} SFSs..", extended_SFSs.size());
   cluster_by_proximity();
   map<pair<int, int>, Cluster> _ext_clusters;
-  for (int i = 0; i < config->threads; i++)
+  for (size_t i = 0; i < _p_sfs_clusters.size(); i++)
     for (const auto &cluster : _p_sfs_clusters[i])
       clusters.push_back(Cluster(cluster.second));
 
@@ -410,10 +410,18 @@ void Clusterer::cluster_by_proximity() {
                        [](const SFS &lhs, const SFS &rhs) {
                          return lhs.re - lhs.rs < rhs.re - rhs.rs;
                        });
-  int dist = (r->re - r->rs) * 1.1; // TODO: add to CLI
-  spdlog::info(
-      "Maximum extended SFS length: {}bp. Using separation distance: {}bp.",
-      r->re - r->rs, dist);
+  int dist;
+  if (config->max_cluster_dist > 0) {
+    dist = config->max_cluster_dist;
+    spdlog::info(
+        "Maximum extended SFS length: {}bp. Using user-defined separation distance: {}bp.",
+        r->re - r->rs, dist);
+  } else {
+    dist = (r->re - r->rs) * 1.1;
+    spdlog::info(
+        "Maximum extended SFS length: {}bp. Using separation distance: {}bp.",
+        r->re - r->rs, dist);
+  }
   // Cluster SFSs inside dist-bp windows
   int prev_i = 0;
   int prev_e = extended_SFSs[0].re;
@@ -433,17 +441,19 @@ void Clusterer::cluster_by_proximity() {
         intervals.push_back(make_pair(prev_i, i - 1));
         prev_e = sfs.re;
         prev_i = i;
+      } else {
+        prev_e = max(prev_e, sfs.re);
       }
     }
   }
   intervals.push_back(make_pair(prev_i, extended_SFSs.size() - 1));
 
   // Cluster SFS inside each interval
-  _p_sfs_clusters.resize(
-      config->threads); // vector<map<pair<int, int>, vector<SFS>>>
+  // Use a per-interval vector instead of per-thread maps to avoid
+  // thread-dependent clustering results
+  vector<map<pair<int, int>, vector<SFS>>> _interval_sfs_clusters(intervals.size());
 #pragma omp parallel for num_threads(config->threads) schedule(static, 1)
   for (size_t i = 0; i < intervals.size(); i++) {
-    int t = omp_get_thread_num();
     int j = intervals[i].first;
     int low = extended_SFSs[j].rs;
     int high = extended_SFSs[j].re;
@@ -458,7 +468,7 @@ void Clusterer::cluster_by_proximity() {
         for (int k = last_j; k < j;
              k++) { // CHECKME: < or <=?
                     // NOTE: <= makes the code waaaay slower
-          _p_sfs_clusters[t][make_pair(low, high)].push_back(extended_SFSs[k]);
+          _interval_sfs_clusters[i][make_pair(low, high)].push_back(extended_SFSs[k]);
         }
         low = sfs.rs;
         high = sfs.re;
@@ -468,9 +478,14 @@ void Clusterer::cluster_by_proximity() {
     for (int k = last_j; k <= intervals[i].second;
          k++) { // CHECKME: it was < but in that way
                 // we were losing an sfs per cluster
-      _p_sfs_clusters[t][make_pair(low, high)].push_back(extended_SFSs[k]);
+      _interval_sfs_clusters[i][make_pair(low, high)].push_back(extended_SFSs[k]);
     }
   }
+  // Flatten into _p_sfs_clusters for compatibility
+  _p_sfs_clusters.resize(1);
+  for (size_t i = 0; i < intervals.size(); i++)
+    for (const auto &cluster : _interval_sfs_clusters[i])
+      _p_sfs_clusters[0][cluster.first] = cluster.second;
 }
 
 // /* Assign coverage and read (sub)sequence to each cluster  */

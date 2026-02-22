@@ -46,6 +46,7 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --noht                           do not use haplotagging information even if present\n"
   // "      --noref                          do not report 0/0 calls\n"
   "      --min-mapq                       minimum mapping quality (default: 20)\n"
+  "      --max-cluster-dist <INT>          maximum distance for clustering SFSs (default: 0, auto-computed)\n"
   "      --clipped                        calls SVs from clipped SFS (EXPERIMENTAL)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
@@ -91,6 +92,7 @@ public:
   bool useht = true;
   // bool noref = false;
   bool clipped = false;
+  int max_cluster_dist = 0; // 0 means auto-computed
 
   string bam = "";
   string sfs = "";

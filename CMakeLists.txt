@@ -200,7 +200,7 @@ target_include_directories(SVDSS
   PRIVATE ${PROJECT_SOURCE_DIR}
 )
 
-target_link_options(SVDSS PRIVATE -static-libgcc -static-libstdc++)
+target_link_options(SVDSS PRIVATE -static-libgcc)
 
 if(DEFINED CONDAPREFIX)
   # link to conda

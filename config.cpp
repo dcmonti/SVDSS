@@ -42,6 +42,7 @@ Configuration::Configuration()
     ("min-sv-length", "", cxxopts::value<int>())
     ("min-mapq", "", cxxopts::value<int>())
     ("min-cluster-weight", "", cxxopts::value<int>())
+    ("max-cluster-dist", "", cxxopts::value<int>())
     ("accp", "", cxxopts::value<float>())
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
     // ("noref", "", cxxopts::value<bool>()->default_value("false"))
@@ -87,6 +88,8 @@ void Configuration::parse(int argc, char **argv) {
     min_sv_length = max(25, results["min-sv-length"].as<int>());
   if (results.count("min-cluster-weight"))
     min_cluster_weight = results["min-cluster-weight"].as<int>();
+  if (results.count("max-cluster-dist"))
+    max_cluster_dist = results["max-cluster-dist"].as<int>();
   if (results.count("min-mapq"))
     min_mapq = results["min-mapq"].as<int>();
   if (results.count("accp"))
