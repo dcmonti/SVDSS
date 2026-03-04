@@ -320,6 +320,10 @@ int PingPong::search() {
   int64_t sfs_to_output = 0;
   spdlog::info("Extracting SFS strings on {} threads..", config->threads);
 
+  // Write source header so that the call step knows whether to invert
+  // coordinates for reverse-strand reads
+  cout << (bam_mode ? "#source=bam" : "#source=fasta") << endl;
+
   while (should_process) {
     if (loaded_last_batch)
       should_load = false;

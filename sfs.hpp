@@ -78,6 +78,17 @@ struct SFS {
   }
 };
 
-unordered_map<string, vector<SFS>> parse_sfsfile(const string &);
+// Source of SFS coordinates: BAM means coordinates are already on the
+// reverse-complemented sequence (as stored by htslib), FASTA means coordinates
+// are on the forward sequence and need to be inverted for reverse-strand reads.
+// UNKNOWN is the default for legacy files without a header.
+enum class SFSSource { UNKNOWN, BAM, FASTA };
+
+struct SFSData {
+  unordered_map<string, vector<SFS>> sfss;
+  SFSSource source;
+};
+
+SFSData parse_sfsfile(const string &);
 
 #endif

@@ -6,9 +6,15 @@ void Caller::run() {
   // load reference genome and SFS
   load_chromosomes(config->reference);
 
-  SFSs = parse_sfsfile(config->sfs);
+  SFSData sfs_data = parse_sfsfile(config->sfs);
+  SFSs = sfs_data.sfss;
+  // SFS from FASTA have forward-strand coordinates that need inversion for
+  // reverse reads. SFS from BAM are already in the right orientation.
+  // UNKNOWN (legacy files without header) are treated as FASTA for backward
+  // compatibility.
+  bool sfs_from_fasta = (sfs_data.source != SFSSource::BAM);
 
-  Clusterer C = Clusterer(&SFSs);
+  Clusterer C = Clusterer(&SFSs, sfs_from_fasta);
   C.run();
 
   spdlog::info("Calling SVs from {} clusters..", C.clusters.size());
@@ -79,17 +85,28 @@ vector<Cluster> Caller::split_cluster_by_len(const Cluster &cluster) {
   vector<Cluster> subclusters;
   for (uint c = 0; c < cluster.size(); ++c) {
     const SubRead &sr = cluster.get_subread(c);
+    float sl = sr.size();
     size_t i;
+    float ratio = -1.0f;
     for (i = 0; i < subclusters.size(); i++) {
       float cl = subclusters[i].get_len();
-      float sl = sr.size();
-      if (min(cl, sl) / max(cl, sl) >= config->min_ratio)
+      float current_ratio = min(cl, sl) / max(cl, sl);
+      ratio = current_ratio;
+      if (current_ratio >= config->min_ratio)
         break;
     }
     if (i == subclusters.size()) {
+      spdlog::debug(
+          "[CALLER_FILTER][SPLIT_BY_LEN][NEW_SUBCLUSTER] chrom={} interval={} read={} len={} subclusters={} min_ratio={}",
+          cluster.chrom, cluster.s, cluster.e, sr.name, sl, subclusters.size(),
+          config->min_ratio);
       subclusters.push_back(Cluster(cluster.chrom, cluster.s, cluster.e,
                                     cluster.cov, cluster.cov0, cluster.cov1,
                                     cluster.cov2));
+    } else {
+      spdlog::debug(
+          "[CALLER_FILTER][SPLIT_BY_LEN][ASSIGNED] chrom={} interval={} read={} len={} subcluster_index={} ratio={:.2f}",
+          cluster.chrom, cluster.s, cluster.e, sr.name, sl, i, ratio);
     }
     subclusters[i].add_subread(sr);
   }
@@ -125,6 +142,10 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
   cluster_2.cov0 = -1;
   cluster_2.cov1 = -1;
 
+  spdlog::debug("[CALLER_SPLIT][HAP_DISTRIBUTION] chrom={} interval={} hap0={} hap1={} hap2={}",
+                cluster.chrom, cluster.s, cluster.e, cluster_0.size(),
+                cluster_1.size(), cluster_2.size());
+
   vector<Cluster> out_subclusters;
   if (cluster_1.size() == 0 && cluster_2.size() == 0) {
     // no alignment is tagged, use length
@@ -142,6 +163,24 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
         i_max2 = i;
       }
     }
+    string subcluster_sizes;
+    for (const auto &sub : subclusters) {
+      if (!subcluster_sizes.empty())
+        subcluster_sizes += ",";
+      subcluster_sizes += to_string(sub.size());
+    }
+    string kept1_desc = (i_max1 != -1)
+                             ? "idx=" + to_string(i_max1) + " size=" +
+                                   to_string(subclusters[i_max1].size())
+                             : "none";
+    string kept2_desc = (i_max2 != -1)
+                             ? "idx=" + to_string(i_max2) + " size=" +
+                                   to_string(subclusters[i_max2].size())
+                             : "none";
+    spdlog::debug(
+        "[CALLER_SPLIT][LEN_ONLY] chrom={} interval={} subclusters={} sizes={} kept1={} kept2={}",
+        cluster.chrom, cluster.s, cluster.e, subclusters.size(),
+        subcluster_sizes, kept1_desc, kept2_desc);
     if (i_max1 != -1)
       out_subclusters.push_back(subclusters[i_max1]);
     if (i_max2 != -1)
@@ -157,9 +196,8 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
       const SubRead &sr = cluster_0.get_subread(c);
       float sl = sr.size();
 
-      // check if we have to put this subread in 1 or 2
       int best_1 = -1;
-      int best_ratio_1 = -1;
+      float best_ratio_1 = -1.0f;
       for (uint i = 0; i < subclusters_1.size(); i++) {
         float cl = subclusters_1[i].get_len();
         float r = min(cl, sl) / max(cl, sl);
@@ -168,8 +206,9 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
           best_ratio_1 = r;
         }
       }
+
       int best_2 = -1;
-      int best_ratio_2 = -1;
+      float best_ratio_2 = -1.0f;
       for (uint i = 0; i < subclusters_2.size(); i++) {
         float cl = subclusters_2[i].get_len();
         float r = min(cl, sl) / max(cl, sl);
@@ -181,35 +220,69 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
 
       if (both == 1) {
         assert(best_2 == -1);
-        if (best_1 == -1)
+        if (best_1 == -1) {
           new_cluster.add_subread(sr);
-        else {
+          spdlog::debug(
+              "[CALLER_SPLIT][UNASSIGNED_HP1_ONLY] chrom={} interval={} read={} len={} new_cluster_reads={} ratio1={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl,
+              new_cluster.size(), best_ratio_1);
+        } else {
           subclusters_1[best_1].add_subread(sr);
           ++subclusters_1[best_1].cov1;
           --new_cluster.cov0;
+          spdlog::debug(
+              "[CALLER_SPLIT][ASSIGNED_HP1_ONLY] chrom={} interval={} read={} len={} hap1_subcluster={} ratio1={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl, best_1,
+              best_ratio_1);
         }
       } else if (both == 2) {
         assert(best_1 == -1);
-        if (best_2 == -1)
+        if (best_2 == -1) {
           new_cluster.add_subread(sr);
-        else {
+          spdlog::debug(
+              "[CALLER_SPLIT][UNASSIGNED_HP2_ONLY] chrom={} interval={} read={} len={} new_cluster_reads={} ratio2={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl,
+              new_cluster.size(), best_ratio_2);
+        } else {
           subclusters_2[best_2].add_subread(sr);
           ++subclusters_2[best_2].cov2;
           --new_cluster.cov0;
+          spdlog::debug(
+              "[CALLER_SPLIT][ASSIGNED_HP2_ONLY] chrom={} interval={} read={} len={} hap2_subcluster={} ratio2={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl, best_2,
+              best_ratio_2);
         }
       } else {
         if (best_1 != -1 && best_ratio_1 > best_ratio_2) {
           subclusters_1[best_1].add_subread(sr);
           ++subclusters_1[best_1].cov1;
           --new_cluster.cov0;
+          spdlog::debug(
+              "[CALLER_SPLIT][ASSIGNED_BOTH] chrom={} interval={} read={} len={} hap1_subcluster={} ratio1={:.2f} ratio2={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl, best_1,
+              best_ratio_1, best_ratio_2);
         } else if (best_2 != -1 && best_ratio_2 > best_ratio_1) {
           subclusters_2[best_2].add_subread(sr);
           ++subclusters_2[best_2].cov2;
           --new_cluster.cov0;
+          spdlog::debug(
+              "[CALLER_SPLIT][ASSIGNED_BOTH] chrom={} interval={} read={} len={} hap2_subcluster={} ratio1={:.2f} ratio2={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl, best_2,
+              best_ratio_1, best_ratio_2);
         } else {
+          new_cluster.add_subread(sr);
+          spdlog::debug(
+              "[CALLER_SPLIT][UNASSIGNED_BOTH] chrom={} interval={} read={} len={} new_cluster_reads={} ratio1={:.2f} ratio2={:.2f}",
+              cluster.chrom, cluster.s, cluster.e, sr.name, sl,
+              new_cluster.size(), best_ratio_1, best_ratio_2);
         }
       }
     }
+
+    spdlog::debug(
+        "[CALLER_SPLIT][UNASSIGNED_SUMMARY] chrom={} interval={} both={} shared_reads={} cov0={}",
+        cluster.chrom, cluster.s, cluster.e, both, new_cluster.size(),
+        new_cluster.cov0);
 
     uint v_max = 0;
     int i_max = -1;
@@ -219,6 +292,20 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
         i_max = i;
       }
     }
+    string hap1_sizes;
+    for (const auto &sub : subclusters_1) {
+      if (!hap1_sizes.empty())
+        hap1_sizes += ",";
+      hap1_sizes += to_string(sub.size());
+    }
+    string hap1_kept_desc = (i_max != -1)
+                                  ? "idx=" + to_string(i_max) + " size=" +
+                                        to_string(subclusters_1[i_max].size())
+                                  : "none";
+    spdlog::debug(
+        "[CALLER_SPLIT][HAP1_FINAL] chrom={} interval={} hap1_subclusters={} sizes={} kept={}",
+        cluster.chrom, cluster.s, cluster.e, subclusters_1.size(), hap1_sizes,
+        hap1_kept_desc);
     if (i_max != -1)
       out_subclusters.push_back(subclusters_1[i_max]);
     v_max = 0, i_max = -1;
@@ -228,11 +315,35 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
         i_max = i;
       }
     }
+    string hap2_sizes;
+    for (const auto &sub : subclusters_2) {
+      if (!hap2_sizes.empty())
+        hap2_sizes += ",";
+      hap2_sizes += to_string(sub.size());
+    }
+    string hap2_kept_desc = (i_max != -1)
+                                  ? "idx=" + to_string(i_max) + " size=" +
+                                        to_string(subclusters_2[i_max].size())
+                                  : "none";
+    spdlog::debug(
+        "[CALLER_SPLIT][HAP2_FINAL] chrom={} interval={} hap2_subclusters={} sizes={} kept={}",
+        cluster.chrom, cluster.s, cluster.e, subclusters_2.size(), hap2_sizes,
+        hap2_kept_desc);
     if (i_max != -1)
       out_subclusters.push_back(subclusters_2[i_max]);
 
     if (both != 3) {
       vector<Cluster> new_subclusters = split_cluster_by_len(new_cluster);
+      string new_sizes;
+      for (const auto &sub : new_subclusters) {
+        if (!new_sizes.empty())
+          new_sizes += ",";
+        new_sizes += to_string(sub.size());
+      }
+      spdlog::debug(
+          "[CALLER_SPLIT][UNASSIGNED_FALLBACK] chrom={} interval={} both={} new_cluster_reads={} new_subclusters={} sizes={}",
+          cluster.chrom, cluster.s, cluster.e, both, new_cluster.size(),
+          new_subclusters.size(), new_sizes);
       v_max = 0, i_max = -1;
       for (uint i = 0; i < new_subclusters.size(); ++i) {
         if (new_subclusters[i].size() > v_max) {
@@ -245,10 +356,28 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
           new_subclusters[i_max].cov1 = -1;
         else
           new_subclusters[i_max].cov2 = -1;
+        spdlog::debug(
+            "[CALLER_SPLIT][UNASSIGNED_FALLBACK_KEEP] chrom={} interval={} selected_idx={} size={}",
+            cluster.chrom, cluster.s, cluster.e, i_max,
+            new_subclusters[i_max].size());
         out_subclusters.push_back(new_subclusters[i_max]);
+      } else {
+        spdlog::debug(
+            "[CALLER_SPLIT][UNASSIGNED_FALLBACK_DROP] chrom={} interval={} no subcluster selected from fallback",
+            cluster.chrom, cluster.s, cluster.e);
       }
     }
   }
+
+  string result_sizes;
+  for (const auto &sub : out_subclusters) {
+    if (!result_sizes.empty())
+      result_sizes += ",";
+    result_sizes += to_string(sub.size());
+  }
+  spdlog::debug(
+      "[CALLER_SPLIT][RESULT] chrom={} interval={} final_subclusters={} sizes={}",
+      cluster.chrom, cluster.s, cluster.e, out_subclusters.size(), result_sizes);
 
   assert(out_subclusters.size() > 0 && out_subclusters.size() <= 2);
   return out_subclusters;
@@ -313,16 +442,35 @@ void Caller::pcall(const vector<Cluster> &clusters) {
   for (size_t i = 0; i < clusters.size(); i++) {
     int t = omp_get_thread_num();
     const Cluster &cluster = clusters[i];
-    if (cluster.size() < config->min_cluster_weight)
+    if (cluster.size() < config->min_cluster_weight) {
+      spdlog::debug(
+          "[CALLER_FILTER][MIN_CLUSTER_WEIGHT] chrom={} interval={} reads={} threshold={}",
+          cluster.chrom, cluster.s, cluster.e, cluster.size(),
+          config->min_cluster_weight);
       continue;
+    }
     string chrom = cluster.chrom;
 
     const vector<Cluster> &subclusters = split_cluster(cluster);
+    string split_sizes;
+    for (const auto &sub : subclusters) {
+      if (!split_sizes.empty())
+        split_sizes += ",";
+      split_sizes += to_string(sub.size());
+    }
+    spdlog::debug(
+        "[CALLER_SPLIT][RESULT] chrom={} interval={} original_reads={} subclusters={} sizes={}",
+        cluster.chrom, cluster.s, cluster.e, cluster.size(), subclusters.size(),
+        split_sizes);
 
     // Calling from one or two clusters
     for (const Cluster &cl : subclusters) {
-      // if (cl.size() < config->min_cluster_weight)
-      //   continue;
+      if (cl.size() < config->min_cluster_weight) {
+        spdlog::debug(
+            "[CALLER_FILTER][MIN_CLUSTER_WEIGHT_POST_SPLIT] chrom={} interval={} subcluster_reads={} threshold={}",
+            cluster.chrom, cluster.s, cluster.e, cl.size(),
+            config->min_cluster_weight);
+      }
 
       vector<SV> _svs;
 
@@ -457,6 +605,9 @@ void Caller::filter_sv_chains() {
         else
           sim = rapidfuzz::fuzz::ratio(sv.altall, prev.altall);
         if (sim > 70) { // FIXME: hardcoded
+          spdlog::debug("[CALLER_CHAIN][MERGE] chrom={} prev_start={} prev_w={} new_start={} new_w={} type={} sim={:.1f} keep={}",
+                        sv.chrom, prev.s, prev.w, sv.s, sv.w, sv.type, sim,
+                        sv.w > prev.w ? "new" : "prev");
           if (sv.w > prev.w)
             _svs.push_back(sv);
           else

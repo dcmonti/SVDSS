@@ -143,6 +143,7 @@ class Clusterer {
 private:
   Configuration *config;
   unordered_map<string, vector<SFS>> *SFSs;
+  bool sfs_from_fasta; // true if SFS coordinates need inversion for rev reads
   vector<SFS> extended_SFSs;
   samFile *bam_file;
   hts_idx_t *bam_index;
@@ -177,7 +178,7 @@ private:
   vector<map<pair<int, int>, vector<SFS>>> _p_sfs_clusters;
 
 public:
-  Clusterer(unordered_map<string, vector<SFS>> *);
+  Clusterer(unordered_map<string, vector<SFS>> *, bool sfs_from_fasta);
 
   vector<Cluster> clusters;
   vector<Clip> clips;

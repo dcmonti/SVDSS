@@ -1,7 +1,8 @@
 #include "clusterer.hpp"
 
-Clusterer::Clusterer(unordered_map<string, vector<SFS>> *_SFSs) {
+Clusterer::Clusterer(unordered_map<string, vector<SFS>> *_SFSs, bool _sfs_from_fasta) {
   SFSs = _SFSs;
+  sfs_from_fasta = _sfs_from_fasta;
   config = Configuration::getInstance();
 }
 
@@ -19,8 +20,12 @@ void Clusterer::run() {
   _p_extended_sfs.resize(config->threads);
   align_and_extend();
   for (int i = 0; i < config->threads; i++) {
-    for (const auto &extsfs : _p_extended_sfs[i])
+    for (const auto &extsfs : _p_extended_sfs[i]) {
+      spdlog::debug(
+          "[SFS_FILTER][PLACED] chrom={} read={} sfs_qs={} sfs_len={} rs={} re={} qs={} qe={}",
+            extsfs.chrom, extsfs.qname, extsfs.qs, extsfs.l, extsfs.rs, extsfs.re, extsfs.qs, extsfs.qe);
       extended_SFSs.push_back(extsfs);
+    }
     clips.insert(clips.begin(), _p_clips[i].begin(), _p_clips[i].end());
   }
   spdlog::info("{}/{}/{} unplaced SFSs. {} erroneus SFSs. {} clipped SFSs.",
@@ -159,19 +164,41 @@ void Clusterer::process_batch(int p, int t) {
 void Clusterer::extend_alignment(bam1_t *aln, int index) {
   char *qname = bam_get_qname(aln);
   uint32_t *cigar = bam_get_cigar(aln);
+  int strand = (aln->core.flag & BAM_FREVERSE) ? -1 : 1;
   vector<pair<int, int>> alpairs = get_aligned_pairs(aln);
   string chrom(bam_header->target_name[aln->core.tid]);
   // TODO: do this check while loading the alignments
   if (chromosome_seqs.find(chrom) == chromosome_seqs.end())
     return;
-
+  // DCM: fix rev compl
   // NOTE: we may have more sfs on a clipped read, but all of them will produce
   // the same clip
   pair<uint, uint> lclip = make_pair(0, 0);
   pair<uint, uint> rclip = make_pair(0, 0);
   int last_pos = 0;
   vector<SFS> local_extended_sfs;
-  for (const SFS &sfs : SFSs->at(qname)) {
+  // If read is on reverse strand AND SFS coordinates come from FASTA
+  // (forward-strand coordinates), invert them and re-sort by qs so that the
+  // last_pos optimization works correctly. When SFS come from BAM, htslib
+  // already provides the sequence in RC orientation, so coordinates match the
+  // alignment as-is.
+  vector<SFS> &read_sfss = SFSs->at(qname);
+  if (strand == -1 && sfs_from_fasta) {
+    int read_len = aln->core.l_qseq;
+    for (SFS &sfs : read_sfss) {
+      int old_qs = sfs.qs;
+      int old_qe = sfs.qe;
+      sfs.qs = read_len - old_qe;
+      sfs.qe = read_len - old_qs;
+      spdlog::debug(
+          "[SFS_FILTER][REV_STRAND] read={} sfs_qs={} sfs_qe={} old_qs={} old_qe={} read len={} sfs len={}",
+          qname, sfs.qs, sfs.qe, old_qs, old_qe, read_len, sfs.l);
+    }
+    sort(read_sfss.begin(), read_sfss.end(),
+         [](const SFS &a, const SFS &b) { return a.qs < b.qs; });
+  }
+  for (SFS &sfs : read_sfss) {
+
     int s = sfs.qs;
     int e = sfs.qs + sfs.l - 1;
     int hp_tag = sfs.htag;
@@ -207,6 +234,9 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     if (refs == -1 && refe == -1) {
       // we couldn't place the first and the last base, so we skip this -
       // otherwise we'll end up considering the entire read
+      spdlog::debug(
+          "[SFS_FILTER][UNPLACED] read={} chrom={} sfs_qs={} sfs_len={} (both boundaries missing)",
+          qname, chrom, sfs.qs, sfs.l);
       ++unplaced;
       continue;
     } else if (refs == -1) {
@@ -214,18 +244,26 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       uint l = bam_cigar_oplen(*(cigar + 0));
       if (op == BAM_CSOFT_CLIP && config->clipped)
         lclip = make_pair(aln->core.pos, l);
-      else
+      else {
+        spdlog::debug(
+            "[SFS_FILTER][START_UNPLACED] read={} chrom={} sfs_qs={} sfs_len={} (no left boundary)",
+            qname, chrom, sfs.qs, sfs.l);
         ++s_unplaced;
+      }
       continue; // in any case, we skip this SFS
     } else if (refe == -1) {
       uint op = bam_cigar_op(*(cigar + aln->core.n_cigar - 1));
       uint l = bam_cigar_oplen(*(cigar + aln->core.n_cigar - 1));
       if (op == BAM_CSOFT_CLIP && config->clipped)
         rclip = make_pair(bam_endpos(aln), l);
-      else
+      else {
+        spdlog::debug(
+            "[SFS_FILTER][END_UNPLACED] read={} chrom={} sfs_qs={} sfs_len={} (no right boundary)",
+            qname, chrom, sfs.qs, sfs.l);
         ++e_unplaced;
+      }
       continue; // in any case, we skip this SFS
-    } else {
+    } else {    
       // we placed the first and last base, so we extract the subalignment
       int last_r = refs - 1;
       for (int i = aln_start; i <= aln_end; i++) {
@@ -243,6 +281,7 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
         if (q != -1 && r != -1 && r >= refe)
           break;
       }
+
     }
 
     // SFS has been placed and local_alpairs contains the subalignment
@@ -293,7 +332,9 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     // NOTE: I think we can solve this by increasing config->flank.
     if (prekmer.first == -1 || prekmer.second == -1 || postkmer.first == -1 ||
         postkmer.second == -1) {
-      spdlog::warn("SFS has not been placed. But why? Check this plz.");
+      spdlog::warn(
+          "[SFS_FILTER][UNKNOWN] read={} chrom={} sfs_qs={} sfs_len={} (failed fallback placement)",
+          qname, chrom, sfs.qs, sfs.l);
       ++unknown;
       continue;
     }
@@ -405,6 +446,12 @@ Clusterer::get_unique_kmers(const vector<pair<int, int>> &alpairs, const uint k,
 }
 
 void Clusterer::cluster_by_proximity() {
+  if (extended_SFSs.empty()) {
+    spdlog::warn("[CLUSTERING] No extended SFSs available. Skipping clustering.");
+    _p_sfs_clusters.clear();
+    return;
+  }
+
   sort(extended_SFSs.begin(), extended_SFSs.end());
   auto r = max_element(extended_SFSs.begin(), extended_SFSs.end(),
                        [](const SFS &lhs, const SFS &rhs) {
@@ -422,6 +469,10 @@ void Clusterer::cluster_by_proximity() {
         "Maximum extended SFS length: {}bp. Using separation distance: {}bp.",
         r->re - r->rs, dist);
   }
+  spdlog::debug(
+      "[CLUSTERING] Start proximity clustering on {} SFSs with distance={}.",
+      extended_SFSs.size(), dist);
+
   // Cluster SFSs inside dist-bp windows
   int prev_i = 0;
   int prev_e = extended_SFSs[0].re;
@@ -431,6 +482,10 @@ void Clusterer::cluster_by_proximity() {
     const auto &sfs = extended_SFSs[i];
     // new chromosome
     if (sfs.chrom != prev_chrom) {
+      spdlog::debug(
+          "[CLUSTERING][NEW_CHROM] closing interval {}:{}-{} (idx {}-{}; n_sfs={})",
+          extended_SFSs[prev_i].chrom, extended_SFSs[prev_i].rs,
+          extended_SFSs[i - 1].re, prev_i, i - 1, (i - prev_i));
       prev_chrom = sfs.chrom;
       intervals.push_back(make_pair(prev_i, i - 1));
       prev_i = i;
@@ -438,6 +493,11 @@ void Clusterer::cluster_by_proximity() {
       continue;
     } else {
       if (sfs.rs - prev_e > dist) {
+        spdlog::debug(
+            "[CLUSTERING][DIST_SPLIT] closing interval {}:{}-{} (idx {}-{}; n_sfs={}) gap={} > dist={}",
+            extended_SFSs[prev_i].chrom, extended_SFSs[prev_i].rs,
+            extended_SFSs[i - 1].re, prev_i, i - 1, (i - prev_i),
+            sfs.rs - prev_e, dist);
         intervals.push_back(make_pair(prev_i, i - 1));
         prev_e = sfs.re;
         prev_i = i;
@@ -447,6 +507,11 @@ void Clusterer::cluster_by_proximity() {
     }
   }
   intervals.push_back(make_pair(prev_i, extended_SFSs.size() - 1));
+  spdlog::debug(
+      "[CLUSTERING] Built {} coarse intervals. Last interval {}:{}-{} (idx {}-{}; n_sfs={})",
+      intervals.size(), extended_SFSs[prev_i].chrom, extended_SFSs[prev_i].rs,
+      extended_SFSs.back().re, prev_i, extended_SFSs.size() - 1,
+      (extended_SFSs.size() - prev_i));
 
   // Cluster SFS inside each interval
   // Use a per-interval vector instead of per-thread maps to avoid
@@ -480,12 +545,28 @@ void Clusterer::cluster_by_proximity() {
                 // we were losing an sfs per cluster
       _interval_sfs_clusters[i][make_pair(low, high)].push_back(extended_SFSs[k]);
     }
+
+    size_t total_sfs = 0;
+    for (const auto &cl : _interval_sfs_clusters[i])
+      total_sfs += cl.second.size();
+    spdlog::debug(
+        "[CLUSTERING][INTERVAL_DONE] interval_idx={} chrom={} idx_range=[{}-{}] clusters={} sfs={}",
+        i, extended_SFSs[intervals[i].first].chrom, intervals[i].first,
+        intervals[i].second, _interval_sfs_clusters[i].size(), total_sfs);
   }
   // Flatten into _p_sfs_clusters for compatibility
   _p_sfs_clusters.resize(1);
   for (size_t i = 0; i < intervals.size(); i++)
     for (const auto &cluster : _interval_sfs_clusters[i])
       _p_sfs_clusters[0][cluster.first] = cluster.second;
+
+  size_t total_clusters = _p_sfs_clusters[0].size();
+  size_t total_sfs = 0;
+  for (const auto &cluster : _p_sfs_clusters[0])
+    total_sfs += cluster.second.size();
+  spdlog::debug(
+      "[CLUSTERING] Final clusters={} total_assigned_sfs={}.",
+      total_clusters, total_sfs);
 }
 
 // /* Assign coverage and read (sub)sequence to each cluster  */
@@ -524,6 +605,9 @@ void Clusterer::fill_clusters() {
 
     size_t cluster_size = reads.size();
     if (cluster_size < config->min_cluster_weight) {
+      spdlog::debug(
+          "[CLUSTER_FILTER][LOW_WEIGHT_PRE] chrom={} start={} end={} uniq_reads={} min_required={}",
+          cluster.chrom, min_s, max_e, cluster_size, config->min_cluster_weight);
       ++small_clusters;
       continue;
     }
@@ -602,6 +686,9 @@ void Clusterer::fill_clusters() {
         // reads starts or ends inside the cluster
         // TODO: get only remaining prefix/suffix? but this may make POA and
         // realignment harder
+        spdlog::debug(
+            "[SFS_FILTER][UNEXTENDED_IN_CLUSTER] cluster={}:{}-{} read={} (cannot project full cluster interval on read)",
+            cluster.chrom, min_s, max_e, qname);
         ++unextended;
       } else {
         string _seq(seq[t], qs, qe - qs + 1);
@@ -611,8 +698,12 @@ void Clusterer::fill_clusters() {
     if (cluster.size() >= config->min_cluster_weight) {
       cluster.set_cov(coverages);
       cluster.set_reads(locus_reads);
-    } else
+    } else {
+      spdlog::debug(
+          "[CLUSTER_FILTER][LOW_WEIGHT_POST] chrom={} start={} end={} subreads={} min_required={}",
+          cluster.chrom, min_s, max_e, cluster.size(), config->min_cluster_weight);
       ++small_clusters_2;
+    }
   }
 
   // clean
