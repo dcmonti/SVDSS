@@ -547,10 +547,42 @@ void Caller::pcall(const vector<Cluster> &clusters) {
         _svs[v].set_cov(cl.cov, cl.cov0, cl.cov1, cl.cov2);
         _svs[v].set_rvec(cluster.reads);
       }
-      for (const SV &sv : _svs)
+      for (const SV &sv : _svs) {
+        if (config->require_sfs_overlap &&
+            !has_overlapping_original_sfs(cluster, cl, sv)) {
+          spdlog::debug(
+              "[CALLER_FILTER][NO_ORIG_SFS_OVERLAP] chrom={} sv_start={} sv_end={} type={} cluster_interval={}:{}-{}",
+              sv.chrom, sv.s, sv.e, sv.type, cluster.chrom, cluster.s,
+              cluster.e);
+          continue;
+        }
         _p_svs[t].push_back(sv);
+      }
     }
   }
+}
+
+bool Caller::has_overlapping_original_sfs(const Cluster &cluster,
+                                          const Cluster &subcluster,
+                                          const SV &sv) const {
+  const vector<string> sub_reads = subcluster.get_names();
+  if (sub_reads.empty())
+    return false;
+  unordered_set<string> subread_set(sub_reads.begin(), sub_reads.end());
+  for (const SFS &sfs : cluster.SFSs) {
+    if (subread_set.find(sfs.qname) == subread_set.end())
+      continue;
+    if (!sfs.orig_intervals.empty()) {
+      for (const auto &interval : sfs.orig_intervals) {
+        if (interval.first <= sv.e && interval.second >= sv.s)
+          return true;
+      }
+    } else {
+      if (sfs.rs <= sv.e && sfs.re >= sv.s)
+        return true;
+    }
+  }
+  return false;
 }
 
 // Clean same SV reported twice

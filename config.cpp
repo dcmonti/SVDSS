@@ -40,10 +40,12 @@ Configuration::Configuration()
     ("bsize", "", cxxopts::value<int>())
     ("omax", "", cxxopts::value<int>())
     ("min-sv-length", "", cxxopts::value<int>())
+    ("min-indel-length", "", cxxopts::value<int>()) // threshold for smoothing minimum length
     ("min-mapq", "", cxxopts::value<int>())
     ("min-cluster-weight", "", cxxopts::value<int>())
     ("max-cluster-dist", "", cxxopts::value<int>())
     ("accp", "", cxxopts::value<float>())
+    ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
     // ("noref", "", cxxopts::value<bool>()->default_value("false"))
     ("noht", "", cxxopts::value<bool>()->default_value("false"))
@@ -86,6 +88,8 @@ void Configuration::parse(int argc, char **argv) {
     reference = results["reference"].as<std::string>();
   if (results.count("min-sv-length"))
     min_sv_length = max(25, results["min-sv-length"].as<int>());
+  if (results.count("min-indel-length"))
+    min_indel_length = results["min-indel-length"].as<int>();
   if (results.count("min-cluster-weight"))
     min_cluster_weight = results["min-cluster-weight"].as<int>();
   if (results.count("max-cluster-dist"))
@@ -98,6 +102,7 @@ void Configuration::parse(int argc, char **argv) {
     min_ratio = results["l"].as<float>();
   binary = results["binary"].as<bool>();
   clipped = results["clipped"].as<bool>();
+  require_sfs_overlap = results["require-sfs-overlap"].as<bool>();
   useht = !results["noht"].as<bool>();
   // noref = results["noref"].as<bool>();
   assemble = !(results["noassemble"].as<bool>());

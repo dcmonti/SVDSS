@@ -25,6 +25,7 @@ static const char INDEX_USAGE_MESSAGE[] =
 static const char SMOOTH_USAGE_MESSAGE[] =
   "SVDSS smooth --reference <reference> --bam <bam>\n"
   "      --min-mapq <INT>                 minimum mapping quality (default: 20)\n"
+  "      --min-indel-length <INT>         indels shorter than this are smoothed out (default: 20)\n"
   "      --accp <FLOAT>                   accuracy percentile for alignments filtering (default: 0.98)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
@@ -43,6 +44,7 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --clusters <FILE>                store clusters to this file (default: do not store)\n"
   "      --min-cluster-weight <INT>       minimum number of supporting superstrings for a call to be reported (default: 2)\n"
   "      --min-sv-length <INT>            minimum length of reported SVs (default: 25)\n"
+  "      --require-sfs-overlap            require at least one original SFS to overlap the SV interval\n"
   "      --noht                           do not use haplotagging information even if present\n"
   // "      --noref                          do not report 0/0 calls\n"
   "      --min-mapq                       minimum mapping quality (default: 20)\n"
@@ -92,6 +94,7 @@ public:
   bool useht = true;
   // bool noref = false;
   bool clipped = false;
+  bool require_sfs_overlap = false;
   int max_cluster_dist = 0; // 0 means auto-computed
 
   string bam = "";

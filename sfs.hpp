@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -39,6 +40,9 @@ struct SFS {
   int l;
   // other
   int htag; // 0: no tag; 1: hap1; 2: hap2
+  // FIXME: we need pairs of intervals because extended SFSs can be merged, is it necessary?
+  vector<pair<int, int>> orig_intervals; // original intervals of the SFS on the reference before extension
+
 
   SFS(const string &_qname, int _qs, int _l, int _htag) {
     chrom = "";
@@ -59,6 +63,10 @@ struct SFS {
     qe = _qe;
     l = qe - qs + 1;
     htag = _htag;
+  }
+
+  void add_orig_interval(int _rs, int _re) {
+    orig_intervals.push_back(make_pair(_rs, _re));
   }
 
   // void reverse(int p) { s = p - s - l; }

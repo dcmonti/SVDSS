@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <iostream>
 #include <map>
+#include <unordered_set>
 
 #include <abpoa.h>
 #include <ksw2.h>
@@ -87,6 +88,9 @@ private:
   void filter_sv_chains();
   void write_vcf();
   void write_sam();
+  bool has_overlapping_original_sfs(const Cluster &cluster,
+                                    const Cluster &subcluster,
+                                    const SV &sv) const;
 
   vector<Cluster> split_cluster_by_len(const Cluster &);
   vector<Cluster> split_cluster(const Cluster &);

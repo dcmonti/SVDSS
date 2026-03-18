@@ -343,10 +343,11 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       spdlog::warn("Error on {}. SFS starting at {} (length {})", qname, sfs.qs,
                    sfs.l);
     } else {
-      local_extended_sfs.push_back(
-          SFS(string(chrom), string(qname), prekmer.second,
-              postkmer.second + config->ksize, prekmer.first,
-              postkmer.first + config->ksize, hp_tag));
+      SFS ext_sfs(string(chrom), string(qname), prekmer.second,
+                  postkmer.second + config->ksize, prekmer.first,
+                  postkmer.first + config->ksize, hp_tag);
+      ext_sfs.add_orig_interval(refs, refe);
+      local_extended_sfs.push_back(ext_sfs);
     }
   }
   // When two SFSs are close but not overlapping, we may end up with two
@@ -371,6 +372,10 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
           min(merged_extended_sfs.at(j).qs, local_extended_sfs.at(i).qs);
       merged_extended_sfs[j].qe =
           max(merged_extended_sfs.at(j).qe, local_extended_sfs.at(i).qe);
+      merged_extended_sfs[j].orig_intervals.insert(
+          merged_extended_sfs[j].orig_intervals.end(),
+          local_extended_sfs.at(i).orig_intervals.begin(),
+          local_extended_sfs.at(i).orig_intervals.end());
     } else {
       merged_extended_sfs.push_back(local_extended_sfs.at(i));
     }
