@@ -87,7 +87,8 @@ void Configuration::parse(int argc, char **argv) {
   if (results.count("reference"))
     reference = results["reference"].as<std::string>();
   if (results.count("min-sv-length"))
-    min_sv_length = max(25, results["min-sv-length"].as<int>());
+    // min_sv_length = max(25, results["min-sv-length"].as<int>());
+    min_sv_length = results["min-sv-length"].as<int>();
   if (results.count("min-indel-length"))
     min_indel_length = results["min-indel-length"].as<int>();
   if (results.count("min-cluster-weight"))
