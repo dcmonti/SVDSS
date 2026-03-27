@@ -506,9 +506,10 @@ void Clusterer::cluster_by_proximity() {
         intervals.push_back(make_pair(prev_i, i - 1));
         prev_e = sfs.re;
         prev_i = i;
-      } else {
-        prev_e = max(prev_e, sfs.re);
       }
+      //else {
+      //  prev_e = max(prev_e, sfs.re);
+      //}
     }
   }
   intervals.push_back(make_pair(prev_i, extended_SFSs.size() - 1));
