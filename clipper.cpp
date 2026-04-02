@@ -105,6 +105,9 @@ int binary_search(const vector<Clip> &clips, uint begin, uint end,
     return -1;
   }
   uint m = (begin + end) / 2;
+  if (m >= clips.size()) {
+    return -1;
+  }
   if (clips[m].p == query.p) {
     if (m + 1 < clips.size()) {
       return m + 1;
@@ -115,6 +118,9 @@ int binary_search(const vector<Clip> &clips, uint begin, uint end,
     if (m > 0 && clips[m - 1].p < query.p) {
       return m;
     }
+    if (m == 0) {
+      return 0; // query is before all clips, return first element
+    }
     return binary_search(clips, begin, m - 1, query);
   } else {
     return binary_search(clips, m + 1, end, query);
@@ -122,8 +128,6 @@ int binary_search(const vector<Clip> &clips, uint begin, uint end,
 }
 
 void Clipper::call(int threads, interval_tree_t<int> &vartree) {
-  // lprint({"Predicting SVS from", to_string(clips.size()), "clipped SFS on",
-  // to_string(threads), "threads.."});
   vector<Clip> rclips;
   vector<Clip> lclips;
   for (const Clip &clip : clips) {
@@ -133,34 +137,43 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       rclips.push_back(clip);
     }
   }
-  // lprint({to_string(lclips.size()), "left clips."});
-  // lprint({to_string(rclips.size()), "right clips."});
-  // lprint({"Preprocessing clipped SFS.."});
+  spdlog::info("Clipped SFS: {} left clips, {} right clips.", lclips.size(),
+               rclips.size());
 #pragma omp parallel for num_threads(2) schedule(static, 1)
   for (int i = 0; i < 2; i++) {
     if (i == 0) {
       rclips = remove_duplicates(rclips);
+      spdlog::info("[CLIP_FILTER][RIGHT] after remove_duplicates: {}", rclips.size());
       rclips = combine(rclips);
-      rclips = filter_lowcovered(rclips, 2); // FIXME: hardcoded
+      spdlog::info("[CLIP_FILTER][RIGHT] after combine: {}", rclips.size());
+      rclips = filter_lowcovered(rclips, 1);
+      spdlog::info("[CLIP_FILTER][RIGHT] after filter_lowcovered(1): {}", rclips.size());
       rclips = filter_tooclose_clips(rclips, vartree);
-      rclips = cluster(rclips, 1000); // FIXME: hardcoded
+      spdlog::info("[CLIP_FILTER][RIGHT] after filter_tooclose_clips: {}", rclips.size());
+      rclips = cluster(rclips, 1000);
+      spdlog::info("[CLIP_FILTER][RIGHT] after cluster(1000): {}", rclips.size());
       sort(rclips.begin(), rclips.end());
     } else {
       lclips = remove_duplicates(lclips);
+      spdlog::info("[CLIP_FILTER][LEFT] after remove_duplicates: {}", lclips.size());
       lclips = combine(lclips);
-      lclips = filter_lowcovered(lclips, 2); // FIXME: hardcoded
+      spdlog::info("[CLIP_FILTER][LEFT] after combine: {}", lclips.size());
+      lclips = filter_lowcovered(lclips, 1);
+      spdlog::info("[CLIP_FILTER][LEFT] after filter_lowcovered(1): {}", lclips.size());
       lclips = filter_tooclose_clips(lclips, vartree);
-      lclips = cluster(lclips, 1000); // FIXME: hardcoded
+      spdlog::info("[CLIP_FILTER][LEFT] after filter_tooclose_clips: {}", lclips.size());
+      lclips = cluster(lclips, 1000);
+      spdlog::info("[CLIP_FILTER][LEFT] after cluster(1000): {}", lclips.size());
       sort(lclips.begin(), lclips.end());
     }
   }
-  // lprint({to_string(lclips.size()), "left clips."});
-  // lprint({to_string(rclips.size()), "right clips."});
+  spdlog::info("After filtering: {} left clips, {} right clips.", lclips.size(),
+               rclips.size());
   _p_svs.resize(threads);
   if (lclips.empty() || rclips.empty()) {
     return;
   }
-  // lprint({"Predicting insertions.."});
+  // Predicting insertions
 #pragma omp parallel for num_threads(threads) schedule(static, 1)
   for (uint i = 0; i < lclips.size(); i++) {
     const Clip &lc = lclips[i];
@@ -185,7 +198,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
           SV("INS", chrom, s, refbase, "<INS>", w, 0, 0, 0, true, l));
     }
   }
-  // lprint({"Predicting deletions.."});
+  // Predicting deletions
 #pragma omp parallel for num_threads(threads) schedule(static, 1)
   for (uint i = 0; i < rclips.size(); i++) {
     const Clip &rc = rclips[i];
