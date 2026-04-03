@@ -18,9 +18,36 @@ void Caller::run() {
   C.run();
 
   spdlog::info("Calling SVs from {} clusters..", C.clusters.size());
+
+  if (!config->normal_contigs_bam.empty()) {
+    spdlog::info("Germline filter enabled: loading normal contigs from {}",
+                 config->normal_contigs_bam);
+    _p_normal_bam = new samFile *[config->threads];
+    _p_normal_idx = new hts_idx_t *[config->threads];
+    _p_normal_hdr = new bam_hdr_t *[config->threads];
+    for (int i = 0; i < config->threads; i++) {
+      _p_normal_bam[i] =
+          hts_open(config->normal_contigs_bam.c_str(), "r");
+      _p_normal_idx[i] = sam_index_load(_p_normal_bam[i],
+                                         config->normal_contigs_bam.c_str());
+      _p_normal_hdr[i] = sam_hdr_read(_p_normal_bam[i]);
+    }
+  }
+
   _p_svs.resize(config->threads);
   _p_alignments.resize(config->threads);
   pcall(C.clusters);
+
+  if (_p_normal_bam) {
+    for (int i = 0; i < config->threads; i++) {
+      sam_hdr_destroy(_p_normal_hdr[i]);
+      hts_idx_destroy(_p_normal_idx[i]);
+      sam_close(_p_normal_bam[i]);
+    }
+    delete[] _p_normal_bam; _p_normal_bam = nullptr;
+    delete[] _p_normal_idx; _p_normal_idx = nullptr;
+    delete[] _p_normal_hdr; _p_normal_hdr = nullptr;
+  }
   for (int i = 0; i < config->threads; i++) {
     svs.insert(svs.begin(), _p_svs[i].begin(), _p_svs[i].end());
     alignments.insert(alignments.begin(), _p_alignments[i].begin(),
@@ -436,6 +463,100 @@ string Caller::run_poa(const vector<string> &seqs) {
   return cons;
 }
 
+// Returns true if sv is found in at least one normal contig that fully covers
+// [cl_s, cl_e]. Contigs not fully covering the region are skipped to avoid
+// false negatives from partial alignments. All fully-covering contigs are
+// checked to account for multiple alleles (diploid/triploid normal genome).
+bool Caller::is_germline(const SV &sv, const string &ref, const string &chrom,
+                         int cl_s, int cl_e, int t) {
+  string region =
+      chrom + ":" + to_string(cl_s) + "-" + to_string(cl_e);
+  hts_itr_t *itr =
+      sam_itr_querys(_p_normal_idx[t], _p_normal_hdr[t], region.c_str());
+  if (!itr)
+    return false;
+
+  int8_t sc_mch = 1, sc_mis = -9, gapo = 16, gape = 2, gapo2 = 41, gape2 = 1;
+  int8_t a = sc_mch, b = sc_mis;
+  int8_t mat[25] = {a, b, b, b, 0, b, a, b, b, 0, b, b, a,
+                    b, 0, b, b, b, a, 0, 0, 0, 0, 0, 0};
+  uint tl = ref.size();
+  uint8_t *ts = (uint8_t *)malloc(tl);
+  for (uint k = 0; k < tl; k++)
+    ts[k] = _char26_table[(uint8_t)ref[k]];
+
+  int pos_tol = 50;
+  int len_tol = max(50, (int)(abs(sv.l) * 0.2));
+
+  bam1_t *aln = bam_init1();
+  bool germline = false;
+
+  while (!germline && sam_itr_next(_p_normal_bam[t], itr, aln) > 0) {
+    if (aln->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY))
+      continue;
+    // Contig must fully cover the cluster region
+    if (aln->core.pos > cl_s || (int)(bam_endpos(aln) - 1) < cl_e)
+      continue;
+
+    // Extract contig subsequence aligned to [cl_s, cl_e]
+    vector<pair<int, int>> alpairs = get_aligned_pairs(aln);
+    uint8_t *bseq = bam_get_seq(aln);
+    string contig_subseq;
+    bool in_range = false;
+    for (const auto &p : alpairs) {
+      int q = p.first, r = p.second;
+      if (r != -1 && r >= cl_s)
+        in_range = true;
+      if (r != -1 && r > cl_e)
+        break;
+      if (in_range && q != -1)
+        contig_subseq += "ACGTN"[bam_seqi(bseq, q)];
+    }
+    if (contig_subseq.empty())
+      continue;
+
+    // ksw2: align contig subsequence against the reference subsequence
+    uint ql = contig_subseq.size();
+    uint8_t *qs = (uint8_t *)malloc(ql);
+    for (uint k = 0; k < ql; k++)
+      qs[k] = _char26_table[(uint8_t)contig_subseq[k]];
+
+    ksw_extz_t ez;
+    memset(&ez, 0, sizeof(ksw_extz_t));
+    ksw_extd2_sse(0, ql, qs, tl, ts, 5, mat, gapo, gape, gapo2, gape2, -1, -1,
+                  -1, 0, &ez);
+    free(qs);
+
+    // Parse contig CIGAR: check if this contig shows the same SV
+    uint rpos = cl_s;
+    for (int k = 0; k < ez.n_cigar && !germline; k++) {
+      uint l = ez.cigar[k] >> 4;
+      char op = "MID"[ez.cigar[k] & 0xf];
+      if (op == 'M') {
+        rpos += l;
+      } else if (op == 'I') {
+        if (sv.type == "INS" && (int)l >= (int)config->min_sv_length &&
+            abs((int)rpos - sv.s) <= pos_tol &&
+            abs((int)l - abs(sv.l)) <= len_tol)
+          germline = true;
+      } else if (op == 'D') {
+        if (sv.type == "DEL" && (int)l >= (int)config->min_sv_length &&
+            abs((int)rpos - sv.s) <= pos_tol &&
+            abs((int)l - abs(sv.l)) <= len_tol)
+          germline = true;
+        rpos += l;
+      }
+    }
+    if (ez.cigar)
+      free(ez.cigar);
+  }
+
+  free(ts);
+  bam_destroy1(aln);
+  hts_itr_destroy(itr);
+  return germline;
+}
+
 // Call SVs by POA+realignment
 void Caller::pcall(const vector<Cluster> &clusters) {
 #pragma omp parallel for num_threads(config->threads) schedule(static, 1)
@@ -555,6 +676,12 @@ void Caller::pcall(const vector<Cluster> &clusters) {
               "[CALLER_FILTER][LOW_ORIG_SFS_OVERLAP] chrom={} sv_start={} sv_end={} type={} cluster_interval={}:{}-{}",
               sv.chrom, sv.s, sv.e, sv.type, cluster.chrom, cluster.s,
               cluster.e);
+          continue;
+        }
+        if (_p_normal_bam && is_germline(sv, ref, chrom, cl.s, cl.e, t)) {
+          spdlog::debug(
+              "[CALLER_FILTER][GERMLINE] chrom={} sv_start={} sv_end={} type={} len={}",
+              sv.chrom, sv.s, sv.e, sv.type, sv.l);
           continue;
         }
         _p_svs[t].push_back(sv);

@@ -50,6 +50,7 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --min-mapq                       minimum mapping quality (default: 20)\n"
   "      --max-cluster-dist <INT>          maximum distance for clustering SFSs (default: 0, auto-computed)\n"
   "      --clipped                        calls SVs from clipped SFS (EXPERIMENTAL)\n"
+  "      --normal-contigs-bam <FILE>      BAM of normal-tissue contigs aligned to reference for germline filtering\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -105,6 +106,7 @@ public:
   string fastq = "";
   string poa = "";
   string clusters = "";
+  string normal_contigs_bam = "";
 
 private:
   Configuration();
