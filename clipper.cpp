@@ -31,13 +31,26 @@ vector<Clip> Clipper::combine(const vector<Clip> &clips) {
     for (auto it = clips_dict[chrom].begin(); it != clips_dict[chrom].end();
          ++it) {
       uint max_l = 0;
+      bool has_sa = false;
+      string sa_chrom = "";
+      uint sa_pos = 0;
       for (const Clip &c : it->second) {
         if (c.l > max_l) {
           max_l = c.l;
         }
+        if (c.sa_has_info) {
+          has_sa = true;
+          sa_chrom = c.sa_chrom;
+          sa_pos = c.sa_pos;
+        }
       }
       Clip clip = Clip("", chrom, it->first, max_l, it->second.front().starting,
                        it->second.size());
+      if (has_sa) {
+        clip.sa_chrom = sa_chrom;
+        clip.sa_pos = sa_pos;
+        clip.sa_has_info = true;
+      }
       _p_combined_clips[t].push_back(clip);
     }
   }
@@ -73,6 +86,11 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
         found = true;
         it->second.l = max(it->second.l, c.l);
         it->second.w += c.w;
+        if (c.sa_has_info) {
+          it->second.sa_chrom = c.sa_chrom;
+          it->second.sa_pos = c.sa_pos;
+          it->second.sa_has_info = true;
+        }
       }
     }
     if (!found) {
@@ -179,6 +197,24 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
     const Clip &lc = lclips[i];
     int t = omp_get_thread_num();
     string chrom = lc.chrom;
+    
+    bool sa_used = false;
+    if (lc.sa_has_info && lc.sa_chrom == chrom) {
+       uint s = min(lc.p, lc.sa_pos);
+       uint e = max(lc.p, lc.sa_pos);
+       uint l = e - s;
+       if (l < 1000) {
+          string refbase(chromosome_seqs[chrom] + s, 1);
+          _p_svs[t].push_back(SV("INS", chrom, s, refbase, "<INS>", lc.w, 0, 0, 0, true, max(lc.l, l)));
+          sa_used = true;
+       } else if (l >= 2000 && l <= 50000 && lc.w >= 5) {
+          string refbase(chromosome_seqs[chrom] + s, 1);
+          _p_svs[t].push_back(SV("DEL", chrom, s, refbase, "<DEL>", lc.w, 0, 0, 0, true, l));
+          sa_used = true;
+       }
+    }
+    if (sa_used) continue;
+
     // we get the closest right clip
     int r = binary_search(rclips, 0, rclips.size() - 1, lc);
     if (r == -1) {
@@ -204,6 +240,25 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
     const Clip &rc = rclips[i];
     int t = omp_get_thread_num();
     string chrom = rc.chrom;
+    
+    // For right clips, SA logic is symmetrical. We can call it here too.
+    bool sa_used = false;
+    if (rc.sa_has_info && rc.sa_chrom == chrom) {
+       uint s = min(rc.p, rc.sa_pos);
+       uint e = max(rc.p, rc.sa_pos);
+       uint l = e - s;
+       if (l < 1000) {
+          string refbase(chromosome_seqs[chrom] + s, 1);
+          _p_svs[t].push_back(SV("INS", chrom, s, refbase, "<INS>", rc.w, 0, 0, 0, true, max(rc.l, l)));
+          sa_used = true;
+       } else if (l >= 2000 && l <= 50000 && rc.w >= 5) {
+          string refbase(chromosome_seqs[chrom] + s, 1);
+          _p_svs[t].push_back(SV("DEL", chrom, s, refbase, "<DEL>", rc.w, 0, 0, 0, true, l));
+          sa_used = true;
+       }
+    }
+    if (sa_used) continue;
+
     // we get the closest right clip
     int l = binary_search(lclips, 0, lclips.size() - 1, rc);
     if (l == -1) {

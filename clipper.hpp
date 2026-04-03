@@ -26,8 +26,12 @@ struct Clip {
   uint l;
   bool starting;
   uint w;
+  // Supplementary alignment info (from SA tag)
+  string sa_chrom;
+  uint sa_pos;
+  bool sa_has_info;
 
-  Clip() { w = 0; }
+  Clip() { w = 0; sa_pos = 0; sa_has_info = false; }
 
   Clip(string name_, string chrom_, const uint p_, uint l_, bool starting_,
        uint w_ = 0) {
@@ -37,7 +41,14 @@ struct Clip {
     l = l_;
     starting = starting_;
     w = w_;
+    sa_pos = 0;
+    sa_has_info = false;
   }
+
+  Clip(string name_, string chrom_, const uint p_, uint l_, bool starting_,
+       string sa_chrom_, uint sa_pos_)
+      : name(name_), chrom(chrom_), p(p_), l(l_), starting(starting_), w(1),
+        sa_chrom(sa_chrom_), sa_pos(sa_pos_), sa_has_info(true) {}
 
   bool operator<(const Clip &c) const { return p < c.p; }
 };

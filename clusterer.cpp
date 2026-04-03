@@ -383,12 +383,41 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
   for (const auto &mes : merged_extended_sfs)
     _p_extended_sfs[index].push_back(mes);
 
-  if (lclip.second > 0)
-    _p_clips[index].push_back(
-        Clip(qname, chrom, lclip.first, lclip.second, true));
-  if (rclip.second > 0)
-    _p_clips[index].push_back(
-        Clip(qname, chrom, rclip.first, rclip.second, false));
+  // Parse SA tag for supplementary alignment info
+  string sa_chrom = "";
+  uint sa_pos = 0;
+  bool has_sa = false;
+  uint8_t *sa_tag = bam_aux_get(aln, "SA");
+  if (sa_tag != NULL) {
+    string sa_str(bam_aux2Z(sa_tag));
+    // SA format: chr,pos,strand,CIGAR,mapQ,NM;
+    size_t p1 = sa_str.find(',');
+    if (p1 != string::npos) {
+      sa_chrom = sa_str.substr(0, p1);
+      size_t p2 = sa_str.find(',', p1 + 1);
+      if (p2 != string::npos) {
+        sa_pos = stoul(sa_str.substr(p1 + 1, p2 - p1 - 1));
+        has_sa = true;
+      }
+    }
+  }
+
+  if (lclip.second > 0) {
+    if (has_sa)
+      _p_clips[index].push_back(
+          Clip(qname, chrom, lclip.first, lclip.second, true, sa_chrom, sa_pos));
+    else
+      _p_clips[index].push_back(
+          Clip(qname, chrom, lclip.first, lclip.second, true));
+  }
+  if (rclip.second > 0) {
+    if (has_sa)
+      _p_clips[index].push_back(
+          Clip(qname, chrom, rclip.first, rclip.second, false, sa_chrom, sa_pos));
+    else
+      _p_clips[index].push_back(
+          Clip(qname, chrom, rclip.first, rclip.second, false));
+  }
 }
 
 /* Get first/last kmer entirely mapped and with a single occurrence in a
