@@ -99,14 +99,17 @@ private:
   // parallelize
   vector<vector<SV>> _p_svs;
   vector<vector<Consensus>> _p_alignments;
+  // per-thread germline-filtered regions: {sv.s, sv.s + abs(sv.l)}
+  // populated in pcall(); merged into the clip vartree in run()
+  vector<vector<pair<int,int>>> _p_germline_regions;
 
   // per-thread handles for normal contigs BAM (optional germline filter)
   samFile **_p_normal_bam = nullptr;
   hts_idx_t **_p_normal_idx = nullptr;
   bam_hdr_t **_p_normal_hdr = nullptr;
 
-  bool is_germline(const SV &sv, const string &ref, const string &chrom,
-                   int cl_s, int cl_e, int t);
+  bool is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
+                   int t);
 
   void print_vcf_header();
 };

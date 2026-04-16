@@ -26,12 +26,18 @@ struct Clip {
   uint l;
   bool starting;
   uint w;
-  // Supplementary alignment info (from SA tag)
+  // Supplementary alignment info
+  bool sa_has_info;
+  bool primary_reverse;
+  bool sa_reverse;
   string sa_chrom;
   uint sa_pos;
-  bool sa_has_info;
+  uint sa_ref_len;
+  uint sa_query_start;
+  uint sa_query_len;
+ 
 
-  Clip() { w = 0; sa_pos = 0; sa_has_info = false; }
+  Clip() { w = 0; sa_has_info = false;}
 
   Clip(string name_, string chrom_, const uint p_, uint l_, bool starting_,
        uint w_ = 0) {
@@ -41,14 +47,17 @@ struct Clip {
     l = l_;
     starting = starting_;
     w = w_;
-    sa_pos = 0;
     sa_has_info = false;
   }
 
+  // Costruttore con Info SA
   Clip(string name_, string chrom_, const uint p_, uint l_, bool starting_,
-       string sa_chrom_, uint sa_pos_)
+       bool primary_reverse_, bool sa_reverse_, string sa_chrom_, uint sa_pos_,
+       uint sa_ref_len_, uint sa_query_start_, uint sa_query_len_)
       : name(name_), chrom(chrom_), p(p_), l(l_), starting(starting_), w(1),
-        sa_chrom(sa_chrom_), sa_pos(sa_pos_), sa_has_info(true) {}
+        sa_has_info(true), primary_reverse(primary_reverse_), sa_reverse(sa_reverse_),
+        sa_chrom(sa_chrom_), sa_pos(sa_pos_), sa_ref_len(sa_ref_len_),
+        sa_query_start(sa_query_start_), sa_query_len(sa_query_len_) {}
 
   bool operator<(const Clip &c) const { return p < c.p; }
 };

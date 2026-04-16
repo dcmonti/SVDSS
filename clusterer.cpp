@@ -385,9 +385,15 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     _p_extended_sfs[index].push_back(mes);
 
   // Parse SA tag for supplementary alignment info
+  bool has_sa = false;
+  bool primary_reverse = (aln->core.flag & BAM_FREVERSE) != 0;
+  bool sa_reverse = false;
   string sa_chrom = "";
   uint sa_pos = 0;
-  bool has_sa = false;
+  uint sa_ref_len = 0;
+  uint sa_query_start = 0;
+  uint sa_query_len = 0;
+
   uint8_t *sa_tag = bam_aux_get(aln, "SA");
   if (sa_tag != NULL) {
     string sa_str(bam_aux2Z(sa_tag));
@@ -398,7 +404,48 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       size_t p2 = sa_str.find(',', p1 + 1);
       if (p2 != string::npos) {
         sa_pos = stoul(sa_str.substr(p1 + 1, p2 - p1 - 1));
-        has_sa = true;
+        size_t p3 = sa_str.find(',', p2 + 1);
+        if (p3 != string::npos) {
+          sa_reverse = (sa_str[p2 + 1] == '-');
+          size_t p4 = sa_str.find(',', p3 + 1);
+          if (p4 != string::npos) {
+            size_t p5 = sa_str.find(',', p4 + 1);
+            int sa_mapq = 0;
+            if (p5 != string::npos) {
+              sa_mapq = stoi(sa_str.substr(p4 + 1, p5 - p4 - 1));
+            }
+            if (sa_mapq >= config->min_mapq) {
+              string sa_cigar = sa_str.substr(p3 + 1, p4 - p3 - 1);
+              has_sa = true;
+              // Parse CIGAR to get lengths
+            int num = 0;
+            bool first_clip_seen = false;
+            for (char c : sa_cigar) {
+              if (isdigit(c)) {
+                num = num * 10 + (c - '0');
+              } else {
+                if (c == 'S' || c == 'H') {
+                  if (!first_clip_seen && sa_query_len == 0) {
+                     sa_query_start = num;
+                  }
+                  first_clip_seen = true;
+                } else if (c == 'M' || c == '=' || c == 'X') {
+                  sa_ref_len += num;
+                  sa_query_len += num;
+                  first_clip_seen = true;
+                } else if (c == 'I') {
+                  sa_query_len += num;
+                  first_clip_seen = true;
+                } else if (c == 'D' || c == 'N') {
+                  sa_ref_len += num;
+                  first_clip_seen = true;
+                }
+                num = 0;
+              }
+            }
+            }
+          }
+        }
       }
     }
   }
@@ -406,7 +453,7 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
   if (lclip.second > 0) {
     if (has_sa)
       _p_clips[index].push_back(Clip(qname, chrom, lclip.first, lclip.second,
-                                     true, sa_chrom, sa_pos));
+                                     true, primary_reverse, sa_reverse, sa_chrom, sa_pos, sa_ref_len, sa_query_start, sa_query_len));
     else
       _p_clips[index].push_back(
           Clip(qname, chrom, lclip.first, lclip.second, true));
@@ -414,7 +461,7 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
   if (rclip.second > 0) {
     if (has_sa)
       _p_clips[index].push_back(Clip(qname, chrom, rclip.first, rclip.second,
-                                     false, sa_chrom, sa_pos));
+                                     false, primary_reverse, sa_reverse, sa_chrom, sa_pos, sa_ref_len, sa_query_start, sa_query_len));
     else
       _p_clips[index].push_back(
           Clip(qname, chrom, rclip.first, rclip.second, false));
@@ -574,7 +621,7 @@ void Clusterer::cluster_by_proximity() {
     // 1. Build a similarity distance for each sfs pair A,B in this cluster,
     // using the formula:
     //    1 - RO(A, B), with RO(A, B) = |[A.rs, A.re] ^ [B.rs, B.re]| /
-    //    min(A.re-A.rs, B.re-B.rs)
+    //    max(A.re-A.rs, B.re-B.rs)
     //    TODO: I'm using the original SFS coords pre extension, is it
     //    necessary?
     // 2. Each SFS is a cluster, iterate and merge the two most similar clusters
@@ -618,8 +665,8 @@ void Clusterer::cluster_by_proximity() {
         float len_a = (float)(a_orig_re - a_orig_rs);
         float len_b = (float)(b_orig_re - b_orig_rs);
 
-        float min_len = min(len_a, len_b);
-        float ro = (min_len > 0) ? ((float)overlap / min_len) : 0.0f;
+        float max_len = max(len_a, len_b);
+        float ro = (max_len > 0) ? ((float)overlap / max_len) : 0.0f;
 
         dist[u][v] = dist[v][u] = 1.0f - ro;
       }

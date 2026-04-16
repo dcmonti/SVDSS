@@ -12,10 +12,21 @@ SV::SV(const string type_, const string &chrom_, uint s_, const string &refall_,
   s = s_;
   refall = refall_;
   altall = altall_;
-  e = s + refall.size() - 1;
+  // For symbolic alleles (<DEL>, <DUP>, <INV>) refall is just the anchor base;
+  // END must be derived from l (SV length) so that END spans the affected region.
+  // For sequence alleles (precise calls) refall contains the actual sequence.
+  if (!altall_.empty() && altall_[0] == '<' &&
+      (type_ == "DEL" || type_ == "DUP" || type_ == "INV") && l_ > 0) {
+    e = s + (int)l_;
+  } else {
+    e = s + (int)refall.size() - 1;
+  }
   w = w_;
   l = l_;
   cov = cov_;
+  cov0 = 0;
+  cov1 = 0;
+  cov2 = 0;
   ngaps = ngaps_;
   score = score_;
   imprecise = imprecise_;
