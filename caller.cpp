@@ -96,9 +96,40 @@ void Caller::run() {
                          clipper._p_svs[i].end());
     }
     spdlog::info("Predicted {} SVs from clipped alignments", s);
-    for (const SV &sv : clipped_svs)
-      if (abs(sv.l) >= (int)config->min_sv_length)
+    // Deduplicate clipped SVs by reciprocal overlap (RO >= 0.9).
+    // Left-clip and right-clip SA paths independently call the same large
+    // deletion from opposite breakpoints; RO with max() denominator merges
+    // them while preserving truly distinct events of different sizes.
+    sort(clipped_svs.begin(), clipped_svs.end());
+    vector<bool> suppressed(clipped_svs.size(), false);
+    for (size_t i = 0; i < clipped_svs.size(); i++) {
+      if (suppressed[i]) continue;
+      for (size_t j = i + 1; j < clipped_svs.size(); j++) {
+        if (suppressed[j]) continue;
+        const SV &a = clipped_svs[i];
+        const SV &b = clipped_svs[j];
+        if (a.chrom != b.chrom || a.type != b.type) continue;
+        int la = abs(a.l), lb = abs(b.l);
+        int isect = max(0, min(a.s + la, b.s + lb) - max(a.s, b.s));
+        double ro = (double)isect / max(la, lb);
+        if (ro >= 0.9) {
+          if (b.w > a.w) {
+            suppressed[i] = true;
+            break;
+          } else {
+            suppressed[j] = true;
+          }
+        }
+      }
+    }
+    for (size_t i = 0; i < clipped_svs.size(); i++) {
+      const SV &sv = clipped_svs[i];
+      if (suppressed[i]) continue;
+      if (abs(sv.l) >= (int)config->min_sv_length) {
+        if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e)) continue;
         cout << sv << endl;
+      }
+    }
   }
 
   destroy_chromosomes();
@@ -106,8 +137,12 @@ void Caller::run() {
 
 void Caller::write_vcf() {
   print_vcf_header();
-  for (const SV &sv : svs)
+  for (const SV &sv : svs) {
+    if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e)) {
+      continue;
+    }
     cout << sv << endl;
+  }
 }
 
 void Caller::write_sam() {
@@ -558,6 +593,14 @@ void Caller::pcall(const vector<Cluster> &clusters) {
   for (size_t i = 0; i < clusters.size(); i++) {
     int t = omp_get_thread_num();
     const Cluster &cluster = clusters[i];
+
+    if (config->bed_filter.overlaps(cluster.chrom, cluster.s, cluster.e)) {
+      spdlog::debug(
+          "[CALLER_FILTER][BED_EXCLUSION] chrom={} interval={}-{} reads={}",
+          cluster.chrom, cluster.s, cluster.e, cluster.size());
+      continue;
+    }
+
     if (cluster.size() < config->min_cluster_weight) {
       spdlog::debug(
           "[CALLER_FILTER][MIN_CLUSTER_WEIGHT] chrom={} interval={} reads={} threshold={}",

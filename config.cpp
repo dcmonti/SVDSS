@@ -47,6 +47,7 @@ Configuration::Configuration()
     ("max-cluster-dist", "", cxxopts::value<int>())
     ("accp", "", cxxopts::value<float>())
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
+    ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
     // ("noref", "", cxxopts::value<bool>()->default_value("false"))
     ("noht", "", cxxopts::value<bool>()->default_value("false"))
@@ -104,6 +105,10 @@ void Configuration::parse(int argc, char **argv) {
     accp = results["accp"].as<float>();
   if (results.count("l"))
     min_ratio = results["l"].as<float>();
+  if (results.count("bed-exclusion")) {
+    bed_exclusion = results["bed-exclusion"].as<std::string>();
+    bed_filter.load(bed_exclusion);
+  }
   binary = results["binary"].as<bool>();
   clipped = results["clipped"].as<bool>();
   require_sfs_overlap = results["require-sfs-overlap"].as<bool>();

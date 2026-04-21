@@ -225,7 +225,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
        // sa_pos is 1-based (SAM spec); lc.p is 0-based (htslib) → convert
        uint sa_pos0 = lc.sa_pos > 0 ? lc.sa_pos - 1 : 0;
        if (lc.sa_chrom != chrom) {
-           // BND: cross-chrom → consume clip regardless of weight
+           // BND: cross-chrom  consume clip regardless of weight
            sa_used = true;
            if (lc.w >= 5) {
                string refbase(chromosome_seqs[chrom] + lc.p, 1);
@@ -328,8 +328,9 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
        } else if (rc.primary_reverse != rc.sa_reverse) {
            // INV: different strand → consume clip regardless of weight
            sa_used = true;
-           uint s = min(rc.p, sa_pos0);
-           uint l = max(rc.p, sa_pos0) - s;
+           uint target_pos = sa_pos0 + rc.sa_ref_len;
+           uint s = min(rc.p, target_pos);
+           uint l = max(rc.p, target_pos) - s;
            if (l >= min_sv_len && rc.w >= 5) {
                string refbase(chromosome_seqs[chrom] + s, 1);
                _p_svs[t].push_back(SV("INV", chrom, s, refbase, "<INV>", rc.w, 0, 0, 0, true, l));

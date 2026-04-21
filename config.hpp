@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "cxxopts.hpp"
+#include "bed_filter.hpp"
 
 using namespace std;
 
@@ -107,6 +108,9 @@ public:
   string poa = "";
   string clusters = "";
   string normal_contigs_bam = "";
+  string bed_exclusion = "";
+  
+  BedFilter bed_filter;
 
 private:
   Configuration();
