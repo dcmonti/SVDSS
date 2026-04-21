@@ -1,5 +1,72 @@
 #include "clusterer.hpp"
 
+namespace {
+
+struct SAEntry {
+  string chrom;
+  uint pos;       // 1-based (SAM spec)
+  bool reverse;
+  int mapq;
+  uint ref_len;
+  uint query_start; // offset in SA's own (aligned) orientation
+  uint query_len;
+};
+
+// Parse a single SA entry "chr,pos,strand,CIGAR,mapQ,NM".
+// Returns false if malformed or below min_mapq.
+static bool parse_sa_entry(const string &entry, int min_mapq, SAEntry &out) {
+  size_t p1 = entry.find(',');
+  if (p1 == string::npos) return false;
+  size_t p2 = entry.find(',', p1 + 1);
+  if (p2 == string::npos) return false;
+  size_t p3 = entry.find(',', p2 + 1);
+  if (p3 == string::npos) return false;
+  size_t p4 = entry.find(',', p3 + 1);
+  if (p4 == string::npos) return false;
+  size_t p5 = entry.find(',', p4 + 1);
+  if (p5 == string::npos) return false;
+
+  out.chrom = entry.substr(0, p1);
+  try {
+    out.pos = stoul(entry.substr(p1 + 1, p2 - p1 - 1));
+    out.mapq = stoi(entry.substr(p4 + 1, p5 - p4 - 1));
+  } catch (...) { return false; }
+  if (out.mapq < min_mapq) return false;
+  out.reverse = (entry[p2 + 1] == '-');
+
+  string sa_cigar = entry.substr(p3 + 1, p4 - p3 - 1);
+  out.ref_len = 0;
+  out.query_start = 0;
+  out.query_len = 0;
+  int num = 0;
+  bool first_clip_seen = false;
+  for (char c : sa_cigar) {
+    if (isdigit(c)) {
+      num = num * 10 + (c - '0');
+    } else {
+      if (c == 'S' || c == 'H') {
+        if (!first_clip_seen && out.query_len == 0)
+          out.query_start = num;
+        first_clip_seen = true;
+      } else if (c == 'M' || c == '=' || c == 'X') {
+        out.ref_len += num;
+        out.query_len += num;
+        first_clip_seen = true;
+      } else if (c == 'I') {
+        out.query_len += num;
+        first_clip_seen = true;
+      } else if (c == 'D' || c == 'N') {
+        out.ref_len += num;
+        first_clip_seen = true;
+      }
+      num = 0;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 Clusterer::Clusterer(unordered_map<string, vector<SFS>> *_SFSs,
                      bool _sfs_from_fasta) {
   SFSs = _SFSs;
@@ -384,87 +451,105 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
   for (const auto &mes : merged_extended_sfs)
     _p_extended_sfs[index].push_back(mes);
 
-  // Parse SA tag for supplementary alignment info
-  bool has_sa = false;
+  // Parse all SA entries from the SA tag (one read may have multiple
+  // supplementary alignments, e.g. complex rearrangements).
   bool primary_reverse = (aln->core.flag & BAM_FREVERSE) != 0;
-  bool sa_reverse = false;
-  string sa_chrom = "";
-  uint sa_pos = 0;
-  uint sa_ref_len = 0;
-  uint sa_query_start = 0;
-  uint sa_query_len = 0;
-
+  vector<SAEntry> sa_entries;
   uint8_t *sa_tag = bam_aux_get(aln, "SA");
   if (sa_tag != NULL) {
     string sa_str(bam_aux2Z(sa_tag));
-    // SA format: chr,pos,strand,CIGAR,mapQ,NM;
-    size_t p1 = sa_str.find(',');
-    if (p1 != string::npos) {
-      sa_chrom = sa_str.substr(0, p1);
-      size_t p2 = sa_str.find(',', p1 + 1);
-      if (p2 != string::npos) {
-        sa_pos = stoul(sa_str.substr(p1 + 1, p2 - p1 - 1));
-        size_t p3 = sa_str.find(',', p2 + 1);
-        if (p3 != string::npos) {
-          sa_reverse = (sa_str[p2 + 1] == '-');
-          size_t p4 = sa_str.find(',', p3 + 1);
-          if (p4 != string::npos) {
-            size_t p5 = sa_str.find(',', p4 + 1);
-            int sa_mapq = 0;
-            if (p5 != string::npos) {
-              sa_mapq = stoi(sa_str.substr(p4 + 1, p5 - p4 - 1));
-            }
-            if (sa_mapq >= config->min_mapq) {
-              string sa_cigar = sa_str.substr(p3 + 1, p4 - p3 - 1);
-              has_sa = true;
-              // Parse CIGAR to get lengths
-            int num = 0;
-            bool first_clip_seen = false;
-            for (char c : sa_cigar) {
-              if (isdigit(c)) {
-                num = num * 10 + (c - '0');
-              } else {
-                if (c == 'S' || c == 'H') {
-                  if (!first_clip_seen && sa_query_len == 0) {
-                     sa_query_start = num;
-                  }
-                  first_clip_seen = true;
-                } else if (c == 'M' || c == '=' || c == 'X') {
-                  sa_ref_len += num;
-                  sa_query_len += num;
-                  first_clip_seen = true;
-                } else if (c == 'I') {
-                  sa_query_len += num;
-                  first_clip_seen = true;
-                } else if (c == 'D' || c == 'N') {
-                  sa_ref_len += num;
-                  first_clip_seen = true;
-                }
-                num = 0;
-              }
-            }
-            }
-          }
-        }
+    size_t s = 0;
+    while (s < sa_str.size()) {
+      size_t e = sa_str.find(';', s);
+      if (e == string::npos) break;
+      if (e > s) {
+        SAEntry sae;
+        if (parse_sa_entry(sa_str.substr(s, e - s), config->min_mapq, sae))
+          sa_entries.push_back(sae);
       }
+      s = e + 1;
     }
   }
 
+  // Compute primary's aligned query span from CIGAR (independent of SFS).
+  uint read_len = aln->core.l_qseq;
+  uint primary_q_start = 0;
+  uint primary_q_end = read_len;
+  if (aln->core.n_cigar > 0) {
+    uint first_op = bam_cigar_op(*(cigar + 0));
+    uint first_l = bam_cigar_oplen(*(cigar + 0));
+    if (first_op == BAM_CSOFT_CLIP || first_op == BAM_CHARD_CLIP)
+      primary_q_start = first_l;
+    uint last_op = bam_cigar_op(*(cigar + aln->core.n_cigar - 1));
+    uint last_l = bam_cigar_oplen(*(cigar + aln->core.n_cigar - 1));
+    if (last_op == BAM_CSOFT_CLIP || last_op == BAM_CHARD_CLIP)
+      primary_q_end = (read_len > last_l) ? (read_len - last_l) : 0;
+  }
+
+  // Convert an SA's query span into the primary's read orientation, so we can
+  // compare it against primary_q_start / primary_q_end directly. SA CIGAR is
+  // expressed in SA's own aligned orientation; if SA strand differs from primary,
+  // its query coordinates need to be flipped onto the primary frame.
+  auto sa_qspan_in_primary = [&](const SAEntry &sa) -> pair<uint, uint> {
+    if (sa.reverse == primary_reverse)
+      return {sa.query_start, sa.query_start + sa.query_len};
+    uint sa_end = sa.query_start + sa.query_len;
+    uint flipped_end = (read_len > sa.query_start) ? (read_len - sa.query_start) : 0;
+    uint flipped_start = (read_len > sa_end) ? (read_len - sa_end) : 0;
+    return {flipped_start, flipped_end};
+  };
+
+  // Pick the SA whose query span is most adjacent to the clip on the read.
+  // For a left clip we match SA's end against primary's aligned start; for a
+  // right clip we match SA's start against primary's aligned end. Tiebreakers
+  // (in order): higher mapq, longer SA reference span.
+  auto pick_best_sa = [&](uint target, bool match_end) -> int {
+    int best = -1;
+    long long best_dist = 0;
+    for (size_t k = 0; k < sa_entries.size(); k++) {
+      auto span = sa_qspan_in_primary(sa_entries[k]);
+      long long d = match_end
+          ? abs((long long)span.second - (long long)target)
+          : abs((long long)span.first - (long long)target);
+      if (best < 0 || d < best_dist) {
+        best = (int)k;
+        best_dist = d;
+      } else if (d == best_dist) {
+        const SAEntry &b = sa_entries[best];
+        const SAEntry &c = sa_entries[k];
+        if (c.mapq > b.mapq ||
+            (c.mapq == b.mapq && c.ref_len > b.ref_len))
+          best = (int)k;
+      }
+    }
+    return best;
+  };
+
   if (lclip.second > 0) {
-    if (has_sa)
+    int best = sa_entries.empty() ? -1 : pick_best_sa(primary_q_start, true);
+    if (best >= 0) {
+      const SAEntry &sa = sa_entries[best];
       _p_clips[index].push_back(Clip(qname, chrom, lclip.first, lclip.second,
-                                     true, primary_reverse, sa_reverse, sa_chrom, sa_pos, sa_ref_len, sa_query_start, sa_query_len));
-    else
+                                     true, primary_reverse, sa.reverse,
+                                     sa.chrom, sa.pos, sa.ref_len,
+                                     sa.query_start, sa.query_len));
+    } else {
       _p_clips[index].push_back(
           Clip(qname, chrom, lclip.first, lclip.second, true));
+    }
   }
   if (rclip.second > 0) {
-    if (has_sa)
+    int best = sa_entries.empty() ? -1 : pick_best_sa(primary_q_end, false);
+    if (best >= 0) {
+      const SAEntry &sa = sa_entries[best];
       _p_clips[index].push_back(Clip(qname, chrom, rclip.first, rclip.second,
-                                     false, primary_reverse, sa_reverse, sa_chrom, sa_pos, sa_ref_len, sa_query_start, sa_query_len));
-    else
+                                     false, primary_reverse, sa.reverse,
+                                     sa.chrom, sa.pos, sa.ref_len,
+                                     sa.query_start, sa.query_len));
+    } else {
       _p_clips[index].push_back(
           Clip(qname, chrom, rclip.first, rclip.second, false));
+    }
   }
 }
 

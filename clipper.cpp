@@ -227,7 +227,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
        if (lc.sa_chrom != chrom) {
            // BND: cross-chrom  consume clip regardless of weight
            sa_used = true;
-           if (lc.w >= 5) {
+           if (lc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + lc.p, 1);
                _p_svs[t].push_back(SV("BND", chrom, lc.p, refbase, "<BND>", lc.w, 0, 0, 0, true, 0));
            }
@@ -236,7 +236,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            sa_used = true;
            uint s = min(lc.p, sa_pos0);
            uint l = max(lc.p, sa_pos0) - s;
-           if (l >= min_sv_len && lc.w >= 5) {
+           if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + s, 1);
                _p_svs[t].push_back(SV("INV", chrom, s, refbase, "<INV>", lc.w, 0, 0, 0, true, l));
            }
@@ -253,7 +253,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            if (diff < 0) {
                // DUP
                long long jump = -diff;
-               if (jump >= min_sv_len && lc.w >= 5) {
+               if (jump >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
                    _p_svs[t].push_back(SV("DUP", chrom, s, refbase, "<DUP>", lc.w, 0, 0, 0, true, jump));
                }
@@ -268,14 +268,14 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
                if (dR > dQ + min_sv_len) {
                    // DEL: reference gap exceeds query gap
                    uint l = dR - dQ;
-                   if (l >= min_sv_len && lc.w >= 5) {
+                   if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        _p_svs[t].push_back(SV("DEL", chrom, s, refbase, "<DEL>", lc.w, 0, 0, 0, true, l));
                    }
                } else if (dQ > dR + min_sv_len) {
                    // INS: query gap exceeds reference gap
                    uint l = dQ - dR;
-                   if (l >= min_sv_len && lc.w >= 5) {
+                   if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        _p_svs[t].push_back(SV("INS", chrom, s, refbase, "<INS>", lc.w, 0, 0, 0, true, l));
                    }
@@ -301,8 +301,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       uint l = max(lc.l, rc.l);
       string refbase(chromosome_seqs[chrom] + s, 1);
       uint w = max(lc.w, rc.w);
-      _p_svs[t].push_back(
-          SV("INS", chrom, s, refbase, "<INS>", w, 0, 0, 0, true, l));
+      if (w >= Configuration::getInstance()->min_cluster_weight) {
+        _p_svs[t].push_back(
+            SV("INS", chrom, s, refbase, "<INS>", w, 0, 0, 0, true, l));
+      }
     }
   }
   // Predicting deletions
@@ -321,7 +323,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
        if (rc.sa_chrom != chrom) {
            // BND: cross-chrom → consume clip regardless of weight
            sa_used = true;
-           if (rc.w >= 5) {
+           if (rc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + rc.p, 1);
                _p_svs[t].push_back(SV("BND", chrom, rc.p, refbase, "<BND>", rc.w, 0, 0, 0, true, 0));
            }
@@ -331,7 +333,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            uint target_pos = sa_pos0 + rc.sa_ref_len;
            uint s = min(rc.p, target_pos);
            uint l = max(rc.p, target_pos) - s;
-           if (l >= min_sv_len && rc.w >= 5) {
+           if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + s, 1);
                _p_svs[t].push_back(SV("INV", chrom, s, refbase, "<INV>", rc.w, 0, 0, 0, true, l));
            }
@@ -349,7 +351,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            if (diff < 0) {
                // DUP
                long long jump = -diff;
-               if (jump >= min_sv_len && rc.w >= 5) {
+               if (jump >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
                    _p_svs[t].push_back(SV("DUP", chrom, s, refbase, "<DUP>", rc.w, 0, 0, 0, true, jump));
                }
@@ -364,14 +366,14 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
                if (dR > dQ + min_sv_len) {
                    // DEL: reference gap exceeds query gap
                    uint l = dR - dQ;
-                   if (l >= min_sv_len && rc.w >= 5) {
+                   if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        _p_svs[t].push_back(SV("DEL", chrom, s, refbase, "<DEL>", rc.w, 0, 0, 0, true, l));
                    }
                } else if (dQ > dR + min_sv_len) {
                    // INS: query gap exceeds reference gap
                    uint l = dQ - dR;
-                   if (l >= min_sv_len && rc.w >= 5) {
+                   if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        _p_svs[t].push_back(SV("INS", chrom, s, refbase, "<INS>", rc.w, 0, 0, 0, true, l));
                    }
@@ -397,7 +399,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       uint l = lc.p - rc.p + 1;
       string refbase(chromosome_seqs[chrom] + s, 1);
       uint w = max(lc.w, rc.w);
-      if (w >= 5) {
+      if (w >= Configuration::getInstance()->min_cluster_weight) {
         _p_svs[t].push_back(
             SV("DEL", chrom, s, refbase, "<DEL>", w, 0, 0, 0, true, l));
       }
