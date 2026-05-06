@@ -1,6 +1,64 @@
 #include "clipper.hpp"
 #include "config.hpp"
 
+namespace {
+// Tolerance (bp) for grouping SA positions into the same vote during majority
+// selection. Long-read split alignments at the same SV breakpoint usually
+// agree to within a few tens of bp; 200 bp is a generous upper bound.
+constexpr uint SA_VOTE_POS_TOL = 200;
+
+struct SAGroup {
+  string sa_chrom;
+  uint sa_pos;
+  uint sa_ref_len;
+  uint sa_query_start;
+  uint sa_query_len;
+  bool primary_reverse;
+  bool sa_reverse;
+  uint count;
+};
+
+static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
+  if (!c.sa_has_info)
+    return;
+  uint w = c.w > 0 ? c.w : 1;
+  for (SAGroup &g : groups) {
+    if (g.sa_chrom == c.sa_chrom && g.primary_reverse == c.primary_reverse &&
+        g.sa_reverse == c.sa_reverse &&
+        (uint)abs((long long)g.sa_pos - (long long)c.sa_pos) <=
+            SA_VOTE_POS_TOL) {
+      g.count += w;
+      return;
+    }
+  }
+  groups.push_back({c.sa_chrom, c.sa_pos, c.sa_ref_len, c.sa_query_start,
+                    c.sa_query_len, c.primary_reverse, c.sa_reverse, w});
+}
+
+static bool sa_vote_winner(const vector<SAGroup> &groups, SAGroup &winner) {
+  if (groups.empty())
+    return false;
+  uint best = 0;
+  for (uint i = 1; i < groups.size(); ++i) {
+    if (groups[i].count > groups[best].count)
+      best = i;
+  }
+  winner = groups[best];
+  return true;
+}
+
+static void apply_sa_winner(Clip &clip, const SAGroup &w) {
+  clip.sa_has_info = true;
+  clip.primary_reverse = w.primary_reverse;
+  clip.sa_reverse = w.sa_reverse;
+  clip.sa_chrom = w.sa_chrom;
+  clip.sa_pos = w.sa_pos;
+  clip.sa_ref_len = w.sa_ref_len;
+  clip.sa_query_start = w.sa_query_start;
+  clip.sa_query_len = w.sa_query_len;
+}
+} // namespace
+
 Clipper::Clipper(const vector<Clip> &_clips) { clips = _clips; }
 
 vector<Clip> Clipper::remove_duplicates(const vector<Clip> &clips) {
@@ -32,41 +90,18 @@ vector<Clip> Clipper::combine(const vector<Clip> &clips) {
     for (auto it = clips_dict[chrom].begin(); it != clips_dict[chrom].end();
          ++it) {
       uint max_l = 0;
-      bool has_sa = false;
-      bool primary_reverse = false;
-      bool sa_reverse = false;
-      string sa_chrom = "";
-      uint sa_pos = 0;
-      uint sa_ref_len = 0;
-      uint sa_query_start = 0;
-      uint sa_query_len = 0;
+      vector<SAGroup> sa_votes;
       for (const Clip &c : it->second) {
         if (c.l > max_l) {
           max_l = c.l;
         }
-        if (c.sa_has_info) {
-          has_sa = true;
-          primary_reverse = c.primary_reverse;
-          sa_reverse = c.sa_reverse;
-          sa_chrom = c.sa_chrom;
-          sa_pos = c.sa_pos;
-          sa_ref_len = c.sa_ref_len;
-          sa_query_start = c.sa_query_start;
-          sa_query_len = c.sa_query_len;
-        }
+        sa_vote_add(sa_votes, c);
       }
       Clip clip = Clip("", chrom, it->first, max_l, it->second.front().starting,
                        it->second.size());
-      if (has_sa) {
-        clip.primary_reverse = primary_reverse;
-        clip.sa_reverse = sa_reverse;
-        clip.sa_chrom = sa_chrom;
-        clip.sa_pos = sa_pos;
-        clip.sa_ref_len = sa_ref_len;
-        clip.sa_query_start = sa_query_start;
-        clip.sa_query_len = sa_query_len;
-        clip.sa_has_info = true;
-      }
+      SAGroup winner;
+      if (sa_vote_winner(sa_votes, winner))
+        apply_sa_winner(clip, winner);
       _p_combined_clips[t].push_back(clip);
     }
   }
@@ -94,6 +129,7 @@ vector<Clip> Clipper::filter_lowcovered(const vector<Clip> &clips,
 vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
   vector<Clip> clusters;
   map<uint, Clip> clusters_by_pos;
+  map<uint, vector<SAGroup>> sa_votes_by_pos;
   for (const Clip &c : clips) {
     bool found = false;
     for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
@@ -102,25 +138,22 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
         found = true;
         it->second.l = max(it->second.l, c.l);
         it->second.w += c.w;
-        if (c.sa_has_info) {
-          it->second.primary_reverse = c.primary_reverse;
-          it->second.sa_reverse = c.sa_reverse;
-          it->second.sa_chrom = c.sa_chrom;
-          it->second.sa_pos = c.sa_pos;
-          it->second.sa_ref_len = c.sa_ref_len;
-          it->second.sa_query_start = c.sa_query_start;
-          it->second.sa_query_len = c.sa_query_len;
-          it->second.sa_has_info = true;
-        }
+        sa_vote_add(sa_votes_by_pos[it->first], c);
       }
     }
     if (!found) {
-      clusters_by_pos[c.p] = c;
+      Clip seed = c;
+      seed.sa_has_info = false;
+      clusters_by_pos[c.p] = seed;
+      sa_vote_add(sa_votes_by_pos[c.p], c);
     }
   }
 
   for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
        it != clusters_by_pos.end(); ++it) {
+    SAGroup winner;
+    if (sa_vote_winner(sa_votes_by_pos[it->first], winner))
+      apply_sa_winner(it->second, winner);
     clusters.push_back(it->second);
   }
   return clusters;
@@ -208,6 +241,21 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
   }
   spdlog::info("After filtering: {} left clips, {} right clips.", lclips.size(),
                rclips.size());
+  {
+    uint l_sa = 0, r_sa = 0;
+    for (const Clip &c : lclips)
+      if (c.sa_has_info && c.sa_query_len > 0)
+        ++l_sa;
+    for (const Clip &c : rclips)
+      if (c.sa_has_info && c.sa_query_len > 0)
+        ++r_sa;
+    spdlog::info("[CLIP_SA] left: {}/{} clips with usable SA ({:.1f}%)",
+                 l_sa, lclips.size(),
+                 lclips.empty() ? 0.0 : 100.0 * l_sa / lclips.size());
+    spdlog::info("[CLIP_SA] right: {}/{} clips with usable SA ({:.1f}%)",
+                 r_sa, rclips.size(),
+                 rclips.empty() ? 0.0 : 100.0 * r_sa / rclips.size());
+  }
   _p_svs.resize(threads);
   if (lclips.empty() || rclips.empty()) {
     return;
