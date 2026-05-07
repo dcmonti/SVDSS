@@ -38,9 +38,23 @@ SV::SV(const string type_, const string &chrom_, uint s_, const string &refall_,
 }
 
 void SV::add_reads(const vector<string> &names) {
-  for (const string &name : names)
-    reads += name + ",";
-  reads.pop_back();
+  for (const string &name : names) {
+    if (name.empty())
+      continue;
+    if (!reads.empty())
+      reads += ",";
+    reads += name;
+  }
+}
+
+void SV::add_sa_reads(const vector<string> &names) {
+  for (const string &name : names) {
+    if (name.empty())
+      continue;
+    if (!sa_reads.empty())
+      sa_reads += ",";
+    sa_reads += name;
+  }
 }
 
 void SV::set_cov(int _cov, int _cov0, int _cov1, int _cov2) {
@@ -82,7 +96,8 @@ ostream &operator<<(ostream &os, const SV &sv) {
      << "NV=" << sv.ngaps << ";"
      << "CIGAR=" << sv.cigar << ";"
      << "RVEC=" << sv.rvec << ";"
-     << "READS=" << sv.reads
+    << "READS=" << sv.reads << ";"
+    << "SA_READS=" << sv.sa_reads
      << (sv.imprecise ? ";IMPRECISE\t" : "\t")
      // -
      << "GT:GQ"

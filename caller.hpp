@@ -5,6 +5,8 @@
 #include <dirent.h>
 #include <iostream>
 #include <map>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <abpoa.h>
@@ -99,9 +101,9 @@ private:
   // parallelize
   vector<vector<SV>> _p_svs;
   vector<vector<Consensus>> _p_alignments;
-  // per-thread germline-filtered regions: {sv.s, sv.s + abs(sv.l)}
-  // populated in pcall(); merged into the clip vartree in run()
-  vector<vector<pair<int,int>>> _p_germline_regions;
+  // per-thread germline-filtered regions: {sv.chrom, sv.s, sv.s + abs(sv.l)}
+  // populated in pcall(); merged into the per-chrom clip vartrees in run()
+  vector<vector<std::tuple<std::string, int, int>>> _p_germline_regions;
 
   // per-thread handles for normal contigs BAM (optional germline filter)
   samFile **_p_normal_bam = nullptr;

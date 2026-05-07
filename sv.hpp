@@ -31,6 +31,7 @@ public:
   bool imprecise;
   string cigar;
   string reads;
+  string sa_reads;
   string rvec;
 
   SV();
@@ -39,6 +40,7 @@ public:
      const int score_, bool imprecise_ = false, uint l_ = 0,
      string cigar_ = ".");
   void add_reads(const vector<string> &reads_);
+    void add_sa_reads(const vector<string> &reads_);
 
   void set_cov(int, int, int, int);
   void set_rvec(const vector<tuple<int, int>> &);

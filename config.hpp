@@ -51,6 +51,7 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --min-mapq                       minimum mapping quality (default: 20)\n"
   "      --max-cluster-dist <INT>          maximum distance for clustering SFSs (default: 0, auto-computed)\n"
   "      --clipped                        calls SVs from clipped SFS (EXPERIMENTAL)\n"
+  "      --no-clipped-fallback            disable paired-clip fallback calls (default: false)\n"
   "      --normal-contigs-bam <FILE>      BAM of normal-tissue contigs aligned to reference for germline filtering\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
@@ -96,6 +97,7 @@ public:
   bool useht = true;
   // bool noref = false;
   bool clipped = false;
+  bool clipped_fallback = true;
   bool require_sfs_overlap = false;
   int max_cluster_dist = 0; // 0 means auto-computed
 

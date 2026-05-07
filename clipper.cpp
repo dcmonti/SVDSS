@@ -57,6 +57,18 @@ static void apply_sa_winner(Clip &clip, const SAGroup &w) {
   clip.sa_query_start = w.sa_query_start;
   clip.sa_query_len = w.sa_query_len;
 }
+
+static void append_names(vector<string> &out, const vector<string> &in) {
+  for (const string &name : in) {
+    if (!name.empty())
+      out.push_back(name);
+  }
+}
+
+static void append_name(vector<string> &out, const string &name) {
+  if (!name.empty())
+    out.push_back(name);
+}
 } // namespace
 
 Clipper::Clipper(const vector<Clip> &_clips) { clips = _clips; }
@@ -91,14 +103,28 @@ vector<Clip> Clipper::combine(const vector<Clip> &clips) {
          ++it) {
       uint max_l = 0;
       vector<SAGroup> sa_votes;
+      vector<string> names;
+      vector<string> sa_names;
       for (const Clip &c : it->second) {
         if (c.l > max_l) {
           max_l = c.l;
+        }
+        if (!c.names.empty())
+          append_names(names, c.names);
+        else
+          append_name(names, c.name);
+        if (c.sa_has_info) {
+          if (!c.sa_names.empty())
+            append_names(sa_names, c.sa_names);
+          else
+            append_name(sa_names, c.name);
         }
         sa_vote_add(sa_votes, c);
       }
       Clip clip = Clip("", chrom, it->first, max_l, it->second.front().starting,
                        it->second.size());
+      clip.names = names;
+      clip.sa_names = sa_names;
       SAGroup winner;
       if (sa_vote_winner(sa_votes, winner))
         apply_sa_winner(clip, winner);
@@ -124,46 +150,67 @@ vector<Clip> Clipper::filter_lowcovered(const vector<Clip> &clips,
   return filtered_clips;
 }
 
-// Cluster clips by proximity
+// Cluster clips by proximity. Clustering is performed independently for each
+// chromosome so that nearby positions on different chroms cannot be merged.
 // TODO: this might be too slow
 vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
+  unordered_map<string, vector<Clip>> by_chrom;
+  for (const Clip &c : clips)
+    by_chrom[c.chrom].push_back(c);
+
   vector<Clip> clusters;
-  map<uint, Clip> clusters_by_pos;
-  map<uint, vector<SAGroup>> sa_votes_by_pos;
-  for (const Clip &c : clips) {
-    bool found = false;
-    for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
-         it != clusters_by_pos.end(); ++it) {
-      if (it->first - r <= c.p && c.p <= it->first + r) {
-        found = true;
-        it->second.l = max(it->second.l, c.l);
-        it->second.w += c.w;
-        sa_vote_add(sa_votes_by_pos[it->first], c);
+  for (auto &kv : by_chrom) {
+    map<uint, Clip> clusters_by_pos;
+    map<uint, vector<SAGroup>> sa_votes_by_pos;
+    for (const Clip &c : kv.second) {
+      bool found = false;
+      for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
+           it != clusters_by_pos.end(); ++it) {
+        if (it->first - r <= c.p && c.p <= it->first + r) {
+          found = true;
+          it->second.l = max(it->second.l, c.l);
+          it->second.w += c.w;
+          if (!c.names.empty())
+            append_names(it->second.names, c.names);
+          else
+            append_name(it->second.names, c.name);
+          if (c.sa_has_info) {
+            if (!c.sa_names.empty())
+              append_names(it->second.sa_names, c.sa_names);
+            else
+              append_name(it->second.sa_names, c.name);
+          }
+          sa_vote_add(sa_votes_by_pos[it->first], c);
+        }
+      }
+      if (!found) {
+        Clip seed = c;
+        seed.sa_has_info = false;
+        clusters_by_pos[c.p] = seed;
+        sa_vote_add(sa_votes_by_pos[c.p], c);
       }
     }
-    if (!found) {
-      Clip seed = c;
-      seed.sa_has_info = false;
-      clusters_by_pos[c.p] = seed;
-      sa_vote_add(sa_votes_by_pos[c.p], c);
-    }
-  }
 
-  for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
-       it != clusters_by_pos.end(); ++it) {
-    SAGroup winner;
-    if (sa_vote_winner(sa_votes_by_pos[it->first], winner))
-      apply_sa_winner(it->second, winner);
-    clusters.push_back(it->second);
+    for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
+         it != clusters_by_pos.end(); ++it) {
+      SAGroup winner;
+      if (sa_vote_winner(sa_votes_by_pos[it->first], winner))
+        apply_sa_winner(it->second, winner);
+      clusters.push_back(it->second);
+    }
   }
   return clusters;
 }
 
-vector<Clip> Clipper::filter_tooclose_clips(const vector<Clip> &clips,
-                                            interval_tree_t<int> &vartree) {
+vector<Clip> Clipper::filter_tooclose_clips(
+    const vector<Clip> &clips,
+    unordered_map<string, interval_tree_t<int>> &vartrees) {
   vector<Clip> fclips;
   for (const Clip &c : clips) {
-    if (vartree.overlap_find({(int)c.p, (int)c.p + 1}) == end(vartree)) {
+    auto it = vartrees.find(c.chrom);
+    if (it == vartrees.end() ||
+        it->second.overlap_find({(int)c.p, (int)c.p + 1}) ==
+            end(it->second)) {
       fclips.push_back(c);
     }
   }
@@ -199,7 +246,8 @@ int binary_search(const vector<Clip> &clips, uint begin, uint end,
   }
 }
 
-void Clipper::call(int threads, interval_tree_t<int> &vartree) {
+void Clipper::call(int threads,
+                   unordered_map<string, interval_tree_t<int>> &vartrees) {
   vector<Clip> rclips;
   vector<Clip> lclips;
   for (const Clip &clip : clips) {
@@ -220,7 +268,7 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       spdlog::info("[CLIP_FILTER][RIGHT] after combine: {}", rclips.size());
       rclips = filter_lowcovered(rclips, 1);
       spdlog::info("[CLIP_FILTER][RIGHT] after filter_lowcovered(1): {}", rclips.size());
-      rclips = filter_tooclose_clips(rclips, vartree);
+      rclips = filter_tooclose_clips(rclips, vartrees);
       spdlog::info("[CLIP_FILTER][RIGHT] after filter_tooclose_clips: {}", rclips.size());
       rclips = cluster(rclips, 1000);
       spdlog::info("[CLIP_FILTER][RIGHT] after cluster(1000): {}", rclips.size());
@@ -232,13 +280,22 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       spdlog::info("[CLIP_FILTER][LEFT] after combine: {}", lclips.size());
       lclips = filter_lowcovered(lclips, 1);
       spdlog::info("[CLIP_FILTER][LEFT] after filter_lowcovered(1): {}", lclips.size());
-      lclips = filter_tooclose_clips(lclips, vartree);
+      lclips = filter_tooclose_clips(lclips, vartrees);
       spdlog::info("[CLIP_FILTER][LEFT] after filter_tooclose_clips: {}", lclips.size());
       lclips = cluster(lclips, 1000);
       spdlog::info("[CLIP_FILTER][LEFT] after cluster(1000): {}", lclips.size());
       sort(lclips.begin(), lclips.end());
     }
   }
+  // Per-chromosome views, used by Path 2 paired-clip lookup so that
+  // binary_search on `p` can never cross chromosome boundaries. Each per-chrom
+  // vector inherits the global sort order.
+  unordered_map<string, vector<Clip>> lclips_by_chrom;
+  unordered_map<string, vector<Clip>> rclips_by_chrom;
+  for (const Clip &c : lclips)
+    lclips_by_chrom[c.chrom].push_back(c);
+  for (const Clip &c : rclips)
+    rclips_by_chrom[c.chrom].push_back(c);
   spdlog::info("After filtering: {} left clips, {} right clips.", lclips.size(),
                rclips.size());
   {
@@ -277,7 +334,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            sa_used = true;
            if (lc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + lc.p, 1);
-               _p_svs[t].push_back(SV("BND", chrom, lc.p, refbase, "<BND>", lc.w, 0, 0, 0, true, 0));
+               SV sv = SV("BND", chrom, lc.p, refbase, "<BND>", lc.w, 0, 0, 0, true, 0);
+               sv.add_reads(lc.names);
+               sv.add_sa_reads(lc.sa_names);
+               _p_svs[t].push_back(sv);
            }
        } else if (lc.primary_reverse != lc.sa_reverse) {
            // INV: different strand → consume clip regardless of weight
@@ -286,7 +346,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            uint l = max(lc.p, sa_pos0) - s;
            if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + s, 1);
-               _p_svs[t].push_back(SV("INV", chrom, s, refbase, "<INV>", lc.w, 0, 0, 0, true, l));
+               SV sv = SV("INV", chrom, s, refbase, "<INV>", lc.w, 0, 0, 0, true, l);
+               sv.add_reads(lc.names);
+               sv.add_sa_reads(lc.sa_names);
+               _p_svs[t].push_back(sv);
            }
        } else {
            // Same chrom, same strand: DEL, INS, DUP
@@ -303,7 +366,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
                long long jump = -diff;
                if (jump >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
-                   _p_svs[t].push_back(SV("DUP", chrom, s, refbase, "<DUP>", lc.w, 0, 0, 0, true, jump));
+                   SV sv = SV("DUP", chrom, s, refbase, "<DUP>", lc.w, 0, 0, 0, true, jump);
+                   sv.add_reads(lc.names);
+                   sv.add_sa_reads(lc.sa_names);
+                   _p_svs[t].push_back(sv);
                }
            } else {
                // DEL or INS
@@ -318,14 +384,20 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
                    uint l = dR - dQ;
                    if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       _p_svs[t].push_back(SV("DEL", chrom, s, refbase, "<DEL>", lc.w, 0, 0, 0, true, l));
+                       SV sv = SV("DEL", chrom, s, refbase, "<DEL>", lc.w, 0, 0, 0, true, l);
+                       sv.add_reads(lc.names);
+                       sv.add_sa_reads(lc.sa_names);
+                       _p_svs[t].push_back(sv);
                    }
                } else if (dQ > dR + min_sv_len) {
                    // INS: query gap exceeds reference gap
                    uint l = dQ - dR;
                    if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       _p_svs[t].push_back(SV("INS", chrom, s, refbase, "<INS>", lc.w, 0, 0, 0, true, l));
+                       SV sv = SV("INS", chrom, s, refbase, "<INS>", lc.w, 0, 0, 0, true, l);
+                       sv.add_reads(lc.names);
+                       sv.add_sa_reads(lc.sa_names);
+                       _p_svs[t].push_back(sv);
                    }
                }
                // If neither threshold met, sa_used stays false → paired-clip fallback
@@ -334,12 +406,23 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
     }
     if (sa_used) continue;
 
-    // we get the closest right clip
-    int r = binary_search(rclips, 0, rclips.size() - 1, lc);
+    // If SA evidence exists for this clip, skip paired-clip fallback to avoid
+    // emitting conflicting calls on the same cluster.
+    if (lc.sa_has_info && lc.sa_query_len > 0)
+      continue;
+
+    if (!Configuration::getInstance()->clipped_fallback)
+      continue;
+
+    // we get the closest right clip on the same chromosome
+    auto rit = rclips_by_chrom.find(lc.chrom);
+    if (rit == rclips_by_chrom.end() || rit->second.empty())
+      continue;
+    int r = binary_search(rit->second, 0, rit->second.size() - 1, lc);
     if (r == -1) {
       continue;
     }
-    auto rc = rclips[r];
+    auto rc = rit->second[r];
     if (rc.w == 0) {
       continue;
     }
@@ -350,8 +433,12 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       string refbase(chromosome_seqs[chrom] + s, 1);
       uint w = max(lc.w, rc.w);
       if (w >= Configuration::getInstance()->min_cluster_weight) {
-        _p_svs[t].push_back(
-            SV("INS", chrom, s, refbase, "<INS>", w, 0, 0, 0, true, l));
+        vector<string> pair_names;
+        append_names(pair_names, lc.names);
+        append_names(pair_names, rc.names);
+        SV sv = SV("INS", chrom, s, refbase, "<INS>", w, 0, 0, 0, true, l);
+        sv.add_reads(pair_names);
+        _p_svs[t].push_back(sv);
       }
     }
   }
@@ -373,7 +460,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            sa_used = true;
            if (rc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + rc.p, 1);
-               _p_svs[t].push_back(SV("BND", chrom, rc.p, refbase, "<BND>", rc.w, 0, 0, 0, true, 0));
+               SV sv = SV("BND", chrom, rc.p, refbase, "<BND>", rc.w, 0, 0, 0, true, 0);
+               sv.add_reads(rc.names);
+               sv.add_sa_reads(rc.sa_names);
+               _p_svs[t].push_back(sv);
            }
        } else if (rc.primary_reverse != rc.sa_reverse) {
            // INV: different strand → consume clip regardless of weight
@@ -383,7 +473,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
            uint l = max(rc.p, target_pos) - s;
            if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + s, 1);
-               _p_svs[t].push_back(SV("INV", chrom, s, refbase, "<INV>", rc.w, 0, 0, 0, true, l));
+               SV sv = SV("INV", chrom, s, refbase, "<INV>", rc.w, 0, 0, 0, true, l);
+               sv.add_reads(rc.names);
+               sv.add_sa_reads(rc.sa_names);
+               _p_svs[t].push_back(sv);
            }
        } else {
            // Same chrom, same strand: DEL, INS, DUP
@@ -401,7 +494,10 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
                long long jump = -diff;
                if (jump >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
-                   _p_svs[t].push_back(SV("DUP", chrom, s, refbase, "<DUP>", rc.w, 0, 0, 0, true, jump));
+                   SV sv = SV("DUP", chrom, s, refbase, "<DUP>", rc.w, 0, 0, 0, true, jump);
+                   sv.add_reads(rc.names);
+                   sv.add_sa_reads(rc.sa_names);
+                   _p_svs[t].push_back(sv);
                }
            } else {
                // DEL or INS
@@ -416,14 +512,20 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
                    uint l = dR - dQ;
                    if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       _p_svs[t].push_back(SV("DEL", chrom, s, refbase, "<DEL>", rc.w, 0, 0, 0, true, l));
+                       SV sv = SV("DEL", chrom, s, refbase, "<DEL>", rc.w, 0, 0, 0, true, l);
+                       sv.add_reads(rc.names);
+                       sv.add_sa_reads(rc.sa_names);
+                       _p_svs[t].push_back(sv);
                    }
                } else if (dQ > dR + min_sv_len) {
                    // INS: query gap exceeds reference gap
                    uint l = dQ - dR;
                    if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       _p_svs[t].push_back(SV("INS", chrom, s, refbase, "<INS>", rc.w, 0, 0, 0, true, l));
+                       SV sv = SV("INS", chrom, s, refbase, "<INS>", rc.w, 0, 0, 0, true, l);
+                       sv.add_reads(rc.names);
+                       sv.add_sa_reads(rc.sa_names);
+                       _p_svs[t].push_back(sv);
                    }
                }
                // If neither threshold met, sa_used stays false → paired-clip fallback
@@ -432,12 +534,23 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
     }
     if (sa_used) continue;
 
-    // we get the closest right clip
-    int l = binary_search(lclips, 0, lclips.size() - 1, rc);
+    // If SA evidence exists for this clip, skip paired-clip fallback to avoid
+    // emitting conflicting calls on the same cluster.
+    if (rc.sa_has_info && rc.sa_query_len > 0)
+      continue;
+
+    if (!Configuration::getInstance()->clipped_fallback)
+      continue;
+
+    // we get the closest left clip on the same chromosome
+    auto lit = lclips_by_chrom.find(rc.chrom);
+    if (lit == lclips_by_chrom.end() || lit->second.empty())
+      continue;
+    int l = binary_search(lit->second, 0, lit->second.size() - 1, rc);
     if (l == -1) {
       continue;
     }
-    auto lc = lclips[l];
+    auto lc = lit->second[l];
     if (lc.w == 0) {
       continue;
     }
@@ -448,8 +561,12 @@ void Clipper::call(int threads, interval_tree_t<int> &vartree) {
       string refbase(chromosome_seqs[chrom] + s, 1);
       uint w = max(lc.w, rc.w);
       if (w >= Configuration::getInstance()->min_cluster_weight) {
-        _p_svs[t].push_back(
-            SV("DEL", chrom, s, refbase, "<DEL>", w, 0, 0, 0, true, l));
+        vector<string> pair_names;
+        append_names(pair_names, lc.names);
+        append_names(pair_names, rc.names);
+        SV sv = SV("DEL", chrom, s, refbase, "<DEL>", w, 0, 0, 0, true, l);
+        sv.add_reads(pair_names);
+        _p_svs[t].push_back(sv);
       }
     }
   }

@@ -49,6 +49,7 @@ Configuration::Configuration()
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
+    ("no-clipped-fallback", "", cxxopts::value<bool>()->default_value("false"))
     // ("noref", "", cxxopts::value<bool>()->default_value("false"))
     ("noht", "", cxxopts::value<bool>()->default_value("false"))
     ("noassemble", "", cxxopts::value<bool>()->default_value("false"))
@@ -111,6 +112,7 @@ void Configuration::parse(int argc, char **argv) {
   }
   binary = results["binary"].as<bool>();
   clipped = results["clipped"].as<bool>();
+  clipped_fallback = !results["no-clipped-fallback"].as<bool>();
   require_sfs_overlap = results["require-sfs-overlap"].as<bool>();
   useht = !results["noht"].as<bool>();
   // noref = results["noref"].as<bool>();

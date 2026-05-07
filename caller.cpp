@@ -77,18 +77,21 @@ void Caller::run() {
   if (config->clipped) {
     spdlog::warn(
         "Calling imprecise SVs from clipped alignments is experimental");
-    interval_tree_t<int> vartree;
+    // Per-chromosome interval trees: ensures clips on chrom A cannot be
+    // filtered/paired against SVs on chrom B that share a coordinate.
+    unordered_map<string, interval_tree_t<int>> vartrees;
     for (const auto &sv : svs)
-      vartree.insert({sv.s - 1000, sv.e + 1000});
+      vartrees[sv.chrom].insert({sv.s - 1000, sv.e + 1000});
     // Also exclude clips near germline-filtered events: these can produce
     // imprecise FP calls (e.g. reads soft-clipped at a germline insertion
     // boundary get paired as a spurious somatic INS or DEL).
     for (int i = 0; i < config->threads; i++)
       for (const auto &r : _p_germline_regions[i])
-        vartree.insert({r.first - 1000, r.second + 1000});
+        vartrees[std::get<0>(r)].insert(
+            {std::get<1>(r) - 1000, std::get<2>(r) + 1000});
     vector<SV> clipped_svs;
     Clipper clipper(C.clips);
-    clipper.call(config->threads, vartree);
+    clipper.call(config->threads, vartrees);
     int s = 0;
     for (int i = 0; i < config->threads; i++) {
       s += clipper._p_svs[i].size();
@@ -722,7 +725,8 @@ void Caller::pcall(const vector<Cluster> &clusters) {
               sv.chrom, sv.s, sv.e, sv.type, sv.l);
           // Record the germline region so that clip-based calls near this
           // event are also suppressed by filter_tooclose_clips().
-          _p_germline_regions[t].push_back({sv.s, sv.s + abs(sv.l)});
+          _p_germline_regions[t].push_back(
+              std::make_tuple(sv.chrom, sv.s, sv.s + abs(sv.l)));
           continue;
         }
         _p_svs[t].push_back(sv);
@@ -892,6 +896,9 @@ void Caller::print_vcf_header() {
   cout << "##INFO=<ID=READS,Number=.,Type=String,Description=\"Reads "
           "identifiers supporting the call\">"
        << endl;
+    cout << "##INFO=<ID=SA_READS,Number=.,Type=String,Description=\"Reads "
+      "with supplementary alignments supporting the call\">"
+         << endl;
   cout << "##INFO=<ID=RVEC,Number=.,Type=String,Description=\"Reads vector "
           "used by genotyper\">"
        << endl;
