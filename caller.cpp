@@ -468,7 +468,7 @@ string Caller::run_poa(const vector<string> &seqs) {
   abpoa_t *ab = abpoa_init();
   abpoa_para_t *abpt = abpoa_init_para();
   abpt->align_mode = 0; // global
-  abpt->disable_seeding = 0;
+  abpt->disable_seeding = 1;
   abpt->progressive_poa = 0;
   abpt->amb_strand = 0;
   abpt->out_msa = 0;

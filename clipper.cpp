@@ -1,6 +1,8 @@
 #include "clipper.hpp"
 #include "config.hpp"
 
+#include <fstream>
+
 namespace {
 // Tolerance (bp) for grouping SA positions into the same vote during majority
 // selection. Long-read split alignments at the same SV breakpoint usually
@@ -68,6 +70,25 @@ static void append_names(vector<string> &out, const vector<string> &in) {
 static void append_name(vector<string> &out, const string &name) {
   if (!name.empty())
     out.push_back(name);
+}
+
+static string join_names(const vector<string> &v) {
+  if (v.empty())
+    return ".";
+  string out;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i)
+      out.push_back(',');
+    out += v[i];
+  }
+  return out;
+}
+
+static string strands_to_string(bool primary_reverse, bool sa_reverse) {
+  string s = "?/?";
+  s[0] = primary_reverse ? '-' : '+';
+  s[2] = sa_reverse ? '-' : '+';
+  return s;
 }
 } // namespace
 
@@ -202,6 +223,104 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
   return clusters;
 }
 
+// Dump the final, fully-filtered/clustered left and right clip sets to a TSV
+// file. For SA-carrying clips also pre-compute the branch (BND/INV/DUP/DEL/INS
+// or NONE) and predicted length using the same formulas as Path 1 in
+// Clipper::call, so the file is enough to debug routing decisions without
+// rerunning with debug logs. No weight thresholds applied here: all final
+// clusters are written regardless of min_cluster_weight.
+void Clipper::store_clip_clusters(const vector<Clip> &lclips,
+                                  const vector<Clip> &rclips) {
+  Configuration *config = Configuration::getInstance();
+  if (config->clip_clusters.empty())
+    return;
+  ofstream f;
+  f.open(config->clip_clusters);
+  f << "#SVDSS clip clusters\n";
+  f << "#fields=chrom:p_1based\tside\tw\tl_max\tn_reads\tn_sa_reads"
+       "\tstrands\tsa_chrom:sa_pos_1based\tsa_ref_len\tsa_query_start"
+       "\tsa_query_len\tdiff\tdR\tdQ\tbranch\tpred_len\treads\tsa_reads\n";
+
+  uint min_sv_len = config->min_sv_length;
+
+  auto write_one = [&](const Clip &c, bool is_left) {
+    f << c.chrom << ":" << (c.p + 1) << "\t" << (is_left ? "L" : "R") << "\t"
+      << c.w << "\t" << c.l << "\t" << c.names.size() << "\t"
+      << c.sa_names.size();
+
+    if (!c.sa_has_info || c.sa_query_len == 0) {
+      // No usable SA info: paired-clip fallback territory.
+      for (int k = 0; k < 9; ++k)
+        f << "\t.";
+      f << "\t" << join_names(c.names) << "\t" << join_names(c.sa_names)
+        << "\n";
+      return;
+    }
+
+    f << "\t" << strands_to_string(c.primary_reverse, c.sa_reverse) << "\t"
+      << c.sa_chrom << ":" << c.sa_pos << "\t" << c.sa_ref_len << "\t"
+      << c.sa_query_start << "\t" << c.sa_query_len;
+
+    string branch;
+    string pred_len = ".";
+    string diff_s = ".", dR_s = ".", dQ_s = ".";
+
+    if (c.sa_chrom != c.chrom) {
+      branch = "BND";
+    } else if (c.primary_reverse != c.sa_reverse) {
+      branch = "INV";
+      uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+      uint inv_len = 0;
+      if (is_left) {
+        uint s = std::min(c.p, sa_pos0);
+        inv_len = std::max(c.p, sa_pos0) - s;
+      } else {
+        uint target_pos = sa_pos0 + c.sa_ref_len;
+        uint s = std::min(c.p, target_pos);
+        inv_len = std::max(c.p, target_pos) - s;
+      }
+      pred_len = std::to_string(inv_len);
+    } else {
+      uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+      long long diff =
+          is_left ? (long long)c.p - (long long)(sa_pos0 + c.sa_ref_len)
+                  : (long long)sa_pos0 - (long long)c.p;
+      diff_s = std::to_string(diff);
+      if (diff < 0) {
+        branch = "DUP";
+        pred_len = std::to_string(-diff);
+      } else {
+        uint dR = (uint)diff;
+        uint sa_q = c.sa_query_start + c.sa_query_len;
+        uint dQ = (c.l > sa_q) ? (c.l - sa_q) : 0;
+        dR_s = std::to_string(dR);
+        dQ_s = std::to_string(dQ);
+        if (dR > dQ + min_sv_len) {
+          branch = "DEL";
+          pred_len = std::to_string(dR - dQ);
+        } else if (dQ > dR + min_sv_len) {
+          branch = "INS";
+          pred_len = std::to_string(dQ - dR);
+        } else {
+          // Same chrom/strand but neither threshold met → falls through to
+          // paired-clip fallback if enabled.
+          branch = "NONE";
+        }
+      }
+    }
+
+    f << "\t" << diff_s << "\t" << dR_s << "\t" << dQ_s << "\t" << branch
+      << "\t" << pred_len << "\t" << join_names(c.names) << "\t"
+      << join_names(c.sa_names) << "\n";
+  };
+
+  for (const Clip &c : lclips)
+    write_one(c, true);
+  for (const Clip &c : rclips)
+    write_one(c, false);
+  f.close();
+}
+
 vector<Clip> Clipper::filter_tooclose_clips(
     const vector<Clip> &clips,
     unordered_map<string, interval_tree_t<int>> &vartrees) {
@@ -312,6 +431,11 @@ void Clipper::call(int threads,
     spdlog::info("[CLIP_SA] right: {}/{} clips with usable SA ({:.1f}%)",
                  r_sa, rclips.size(),
                  rclips.empty() ? 0.0 : 100.0 * r_sa / rclips.size());
+  }
+  if (!Configuration::getInstance()->clip_clusters.empty()) {
+    spdlog::info("Storing clip clusters to {}",
+                 Configuration::getInstance()->clip_clusters);
+    store_clip_clusters(lclips, rclips);
   }
   _p_svs.resize(threads);
   if (lclips.empty() || rclips.empty()) {

@@ -83,6 +83,8 @@ private:
       const vector<Clip> &,
       std::unordered_map<std::string,
                          lib_interval_tree::interval_tree_t<int>> &);
+  void store_clip_clusters(const vector<Clip> &lclips,
+                           const vector<Clip> &rclips);
 
 public:
   vector<vector<SV>> _p_svs;

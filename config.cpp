@@ -32,6 +32,7 @@ Configuration::Configuration()
     ("sfs", "", cxxopts::value<std::string>())
     ("poa", "", cxxopts::value<std::string>())
     ("clusters", "", cxxopts::value<std::string>())
+    ("clip-clusters", "", cxxopts::value<std::string>())
     ("normal-contigs-bam", "", cxxopts::value<std::string>())
     ("index", "", cxxopts::value<std::string>())
     ("fastx", "", cxxopts::value<std::string>())
@@ -72,6 +73,8 @@ void Configuration::parse(int argc, char **argv) {
     poa = results["poa"].as<std::string>();
   if (results.count("clusters"))
     clusters = results["clusters"].as<std::string>();
+  if (results.count("clip-clusters"))
+    clip_clusters = results["clip-clusters"].as<std::string>();
   if (results.count("normal-contigs-bam"))
     normal_contigs_bam = results["normal-contigs-bam"].as<std::string>();
   if (results.count("index"))
