@@ -7,14 +7,11 @@
 
 #include "caller.hpp"
 #include "config.hpp"
+#include "indexer.hpp"
 #include "ping_pong.hpp"
 #include "smoother.hpp"
 
 using namespace std;
-
-extern "C" {
-int main_build(int argc, char *argv[]);
-}
 
 const string version = "v2.1.0";
 
@@ -30,11 +27,11 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  // Run ropebwt3 build if index mode
+  // Run ropebwt3 build if index mode (with optional --hpc preprocessing)
   if (strcmp(argv[1], "index") == 0) {
-    spdlog::info(
-        "We rely on 'ropebwt3 build' - just exposing it for convenience");
-    main_build(argc - 1, argv + 1);
+    int rc = run_index(argc - 1, argv + 1);
+    if (rc != 0)
+      exit(rc);
   } else {
     // Get configuration and run
     auto c = Configuration::getInstance();

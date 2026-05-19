@@ -65,6 +65,7 @@ private:
 
   int bam_mode;
   int reads_processed = 0;
+  bool hpc_mode = false;
 
   gzFile fastq_file;
   kseq_t *fastq_iterator;
@@ -75,6 +76,14 @@ private:
   vector<vector<vector<uint>>> read_seq_lengths;
   vector<vector<vector<uint>>> read_seq_max_lengths;
   vector<vector<vector<uint8_t *>>> read_seqs;
+  // HPC-mode parallel buffers (same shape as read_seqs). For each read we
+  // store the HPC-compressed nt6 sequence, its length, and an int array
+  // `hpc_to_orig[0..hpc_len]` mapping each compressed position back to the
+  // first original position of that run (with a sentinel at index hpc_len
+  // equal to the original length). Allocated/grown alongside read_seqs.
+  vector<vector<vector<uint8_t *>>> read_seqs_hpc;
+  vector<vector<vector<int *>>> read_seqs_hpc_map;
+  vector<vector<vector<uint>>> read_seqs_hpc_lengths;
   vector<vector<vector<string>>> read_names;
   vector<vector<vector<bam1_t *>>> bam_entries;
   vector<vector<vector<fastq_entry_t>>> fastq_entries;
@@ -82,7 +91,7 @@ private:
   bool load_batch_fastq(int, int, int);
   batch_type_t process_batch(const rb3_fmi_t *, int, int);
   void ping_pong_search(const rb3_fmi_t *, const string &, uint8_t *, int,
-                        vector<SFS> &, int);
+                        vector<SFS> &, int, const int *hpc_to_orig = nullptr);
   void output_batch(int);
 
   vector<vector<batch_type_t>> obatches;

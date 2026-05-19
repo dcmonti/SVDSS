@@ -1,9 +1,17 @@
 #include "ping_pong.hpp"
 
-// Compute SFS strings from P and store them into solutions
+#include <sys/stat.h>
+
+#include "chromosomes.hpp"
+
+// Compute SFS strings from P and store them into solutions. When
+// `hpc_to_orig` is non-null, P is the HPC-compressed read and l its HPC
+// length; the SFS produced is translated back to original read coordinates
+// so the rest of the pipeline sees positions in the uncompressed read.
 void PingPong::ping_pong_search(const rb3_fmi_t *index, const string &qname,
                                 uint8_t *P, int l, vector<SFS> &solutions,
-                                int hp_tag) {
+                                int hp_tag,
+                                const int *hpc_to_orig /* default in .hpp */) {
   rb3_sai_t ik;
   int begin = l - 1;
   while (begin >= 0) {
@@ -36,8 +44,18 @@ void PingPong::ping_pong_search(const rb3_fmi_t *index, const string &qname,
       ik = ok[P[end] >= 1 && P[end] <= 4 ? 5 - P[end] : P[end]];
     }
 
-    int sfs_len = end - begin + 1;
-    SFS sfs(qname, begin, sfs_len, hp_tag);
+    int emit_qs;
+    int emit_len;
+    if (hpc_to_orig != nullptr) {
+      // begin/end are HPC positions; translate to original-read coordinates.
+      emit_qs = hpc_to_orig[begin];
+      int emit_qe = hpc_to_orig[end + 1] - 1; // inclusive end in orig coords
+      emit_len = emit_qe - emit_qs + 1;
+    } else {
+      emit_qs = begin;
+      emit_len = end - begin + 1;
+    }
+    SFS sfs(qname, emit_qs, emit_len, hp_tag);
     solutions.push_back(sfs);
     if (begin == 0)
       break;
@@ -86,12 +104,29 @@ bool PingPong::load_batch_bam(int p) {
       read_seqs[p][nseqs % config->threads][i] =
           (uint8_t *)malloc(sizeof(char) * (l + 1));
       read_seq_max_lengths[p][nseqs % config->threads][i] = l;
+      if (hpc_mode) {
+        free(read_seqs_hpc[p][nseqs % config->threads][i]);
+        free(read_seqs_hpc_map[p][nseqs % config->threads][i]);
+        read_seqs_hpc[p][nseqs % config->threads][i] =
+            (uint8_t *)malloc(sizeof(uint8_t) * (l + 1));
+        read_seqs_hpc_map[p][nseqs % config->threads][i] =
+            (int *)malloc(sizeof(int) * (l + 1));
+      }
     }
     uint8_t *q = bam_get_seq(alignment);
     for (uint _ = 0; _ < l; _++)
       read_seqs[p][nseqs % config->threads][i][_] =
           seq_nt6_table[(int)seq_nt16_str[bam_seqi(q, _)]];
     read_seqs[p][nseqs % config->threads][i][l] = '\0';
+
+    if (hpc_mode) {
+      int hpc_len = hpc_compress_nt6(
+          read_seqs[p][nseqs % config->threads][i], (int)l,
+          read_seqs_hpc[p][nseqs % config->threads][i],
+          read_seqs_hpc_map[p][nseqs % config->threads][i]);
+      read_seqs_hpc[p][nseqs % config->threads][i][hpc_len] = '\0';
+      read_seqs_hpc_lengths[p][nseqs % config->threads][i] = (uint)hpc_len;
+    }
 
     // flag batch to be process
     processed[p][nseqs % config->threads] = false;
@@ -150,6 +185,14 @@ bool PingPong::load_batch_fastq(int threads, int batch_size, int p) {
       free(read_seqs[p][n % threads][i]);
       read_seqs[p][n % threads][i] = (uint8_t *)malloc(sizeof(char) * (l + 1));
       read_seq_max_lengths[p][n % threads][i] = l;
+      if (hpc_mode) {
+        free(read_seqs_hpc[p][n % threads][i]);
+        free(read_seqs_hpc_map[p][n % threads][i]);
+        read_seqs_hpc[p][n % threads][i] =
+            (uint8_t *)malloc(sizeof(uint8_t) * (l + 1));
+        read_seqs_hpc_map[p][n % threads][i] =
+            (int *)malloc(sizeof(int) * (l + 1));
+      }
     }
     for (uint _ = 0; _ < l; _++) {
       read_seqs[p][n % threads][i][_] = fastq_entries[p][n % threads][i].seq[_];
@@ -157,6 +200,15 @@ bool PingPong::load_batch_fastq(int threads, int batch_size, int p) {
     read_seqs[p][n % threads][i][l] = '\0';
     rb3_char2nt6(l, read_seqs[p][n % threads][i]); // convert to integers
     read_names[p][n % threads][i] = fastq_iterator->name.s;
+
+    if (hpc_mode) {
+      int hpc_len = hpc_compress_nt6(
+          read_seqs[p][n % threads][i], (int)l,
+          read_seqs_hpc[p][n % threads][i],
+          read_seqs_hpc_map[p][n % threads][i]);
+      read_seqs_hpc[p][n % threads][i][hpc_len] = '\0';
+      read_seqs_hpc_lengths[p][n % threads][i] = (uint)hpc_len;
+    }
 
     // flag batch to be process
     processed[p][n % threads] = false;
@@ -179,13 +231,15 @@ batch_type_t PingPong::process_batch(const rb3_fmi_t *index, int p,
   // store read id once for all strings to save space, is it worth it?
   if (!bam_mode) {
     for (uint j = 0; j < read_seqs[p][thread].size(); j++) {
-      ping_pong_search(
-          index, read_names[p][thread][j], read_seqs[p][thread][j],
-          strlen(
-              (char *)read_seqs[p][thread]
-                               [j]), // FIXME: this may be inefficient. We were
-                                     // storing lengths in a vector as sequences
-          solutions[read_names[p][thread][j]], 0);
+      uint8_t *P = hpc_mode ? read_seqs_hpc[p][thread][j]
+                            : read_seqs[p][thread][j];
+      int len = hpc_mode
+                    ? (int)read_seqs_hpc_lengths[p][thread][j]
+                    : (int)strlen((char *)read_seqs[p][thread][j]);
+      const int *hpc_map =
+          hpc_mode ? read_seqs_hpc_map[p][thread][j] : nullptr;
+      ping_pong_search(index, read_names[p][thread][j], P, len,
+                       solutions[read_names[p][thread][j]], 0, hpc_map);
     }
   } else {
     for (uint j = 0; j < bam_entries[p][thread].size(); j++) {
@@ -201,8 +255,13 @@ batch_type_t PingPong::process_batch(const rb3_fmi_t *index, int p,
                      : 0;
       if (config->putative and xf_t != 0)
         continue;
-      ping_pong_search(index, qname, read_seqs[p][thread][j], aln->core.l_qseq,
-                       solutions[qname], hp_t);
+      uint8_t *P =
+          hpc_mode ? read_seqs_hpc[p][thread][j] : read_seqs[p][thread][j];
+      int len = hpc_mode ? (int)read_seqs_hpc_lengths[p][thread][j]
+                         : aln->core.l_qseq;
+      const int *hpc_map =
+          hpc_mode ? read_seqs_hpc_map[p][thread][j] : nullptr;
+      ping_pong_search(index, qname, P, len, solutions[qname], hp_t, hpc_map);
     }
   }
   return solutions;
@@ -243,6 +302,18 @@ int PingPong::search() {
   spdlog::info("Restoring index..");
   rb3_fmi_t index;
   rb3_fmi_restore(&index, config->index.c_str(), 0);
+
+  // Auto-detect HPC mode from the sidecar marker left by the index step.
+  {
+    struct stat st;
+    string hpc_marker = config->index + ".hpc";
+    if (stat(hpc_marker.c_str(), &st) == 0) {
+      hpc_mode = true;
+      spdlog::info("HPC sidecar detected ({}): reads will be "
+                   "homopolymer-compressed before search",
+                   hpc_marker);
+    }
+  }
   if (config->bam != "") {
     bam_file = hts_open(config->bam.c_str(), "r");
     bam_header = sam_hdr_read(bam_file);
@@ -286,11 +357,23 @@ int PingPong::search() {
         vector<vector<string>>(config->threads)); // current and next output
     read_seq_max_lengths.push_back(
         vector<vector<uint>>(config->threads)); // current and next output
+    if (hpc_mode) {
+      read_seqs_hpc.push_back(vector<vector<uint8_t *>>(config->threads));
+      read_seqs_hpc_map.push_back(vector<vector<int *>>(config->threads));
+      read_seqs_hpc_lengths.push_back(vector<vector<uint>>(config->threads));
+    }
     for (int j = 0; j < config->threads; j++) {
       for (int k = 0; k < config->batch_size / config->threads; k++) {
         read_seqs[i][j].push_back((uint8_t *)malloc(sizeof(uint8_t) * (30001)));
         read_names[i][j].push_back("");
         read_seq_max_lengths[i][j].push_back(30000);
+        if (hpc_mode) {
+          read_seqs_hpc[i][j].push_back(
+              (uint8_t *)malloc(sizeof(uint8_t) * (30001)));
+          read_seqs_hpc_map[i][j].push_back(
+              (int *)malloc(sizeof(int) * (30001)));
+          read_seqs_hpc_lengths[i][j].push_back(0);
+        }
       }
     }
   }

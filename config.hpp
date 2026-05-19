@@ -36,6 +36,7 @@ static const char SEARCH_USAGE_MESSAGE[] =
   "      --bsize <INT>                    batch size (default: 10000)\n"
   "      --noputative                     when input is smoothed bam, do not filter unsmoothed reads (default: putative)\n"
   "      --noassemble                     do not assemble specific strings overlapping on a read (default: assemble)\n"
+  "      --hpc                            homopolymer-compress reads before search; the index must have been built with --hpc\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -85,6 +86,7 @@ public:
   // pingpong.search
   bool assemble = true;
   bool putative = true;
+  bool hpc = false; // homopolymer-compressed search (requires HPC-built index)
   int overlap = -1;
   int max_output = 100000;
   // call

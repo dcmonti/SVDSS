@@ -55,6 +55,7 @@ Configuration::Configuration()
     ("noht", "", cxxopts::value<bool>()->default_value("false"))
     ("noassemble", "", cxxopts::value<bool>()->default_value("false"))
     ("noputative", "", cxxopts::value<bool>()->default_value("false"))
+    ("hpc", "", cxxopts::value<bool>()->default_value("false"))
     ("binary", "", cxxopts::value<bool>()->default_value("false"))
     ("version", "Print version information.")
     ("h,help", "Print this help.")
@@ -121,6 +122,7 @@ void Configuration::parse(int argc, char **argv) {
   // noref = results["noref"].as<bool>();
   assemble = !(results["noassemble"].as<bool>());
   putative = !(results["noputative"].as<bool>());
+  hpc = results["hpc"].as<bool>();
   version = results["version"].as<bool>();
   verbose = results["verbose"].as<bool>();
   help = results["help"].as<bool>();
