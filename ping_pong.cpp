@@ -1,7 +1,5 @@
 #include "ping_pong.hpp"
 
-#include <sys/stat.h>
-
 #include "chromosomes.hpp"
 
 // Compute SFS strings from P and store them into solutions. When
@@ -303,17 +301,13 @@ int PingPong::search() {
   rb3_fmi_t index;
   rb3_fmi_restore(&index, config->index.c_str(), 0);
 
-  // Auto-detect HPC mode from the sidecar marker left by the index step.
-  {
-    struct stat st;
-    string hpc_marker = config->index + ".hpc";
-    if (stat(hpc_marker.c_str(), &st) == 0) {
-      hpc_mode = true;
-      spdlog::info("HPC sidecar detected ({}): reads will be "
-                   "homopolymer-compressed before search",
-                   hpc_marker);
-    }
-  }
+  // HPC mode is driven solely by the explicit --hpc flag: if the caller asks
+  // for HPC, reads are homopolymer-compressed before search. It is the
+  // caller's responsibility to point --hpc search at an HPC-built index (and
+  // vice versa); we do not infer the index nature from files on disk.
+  hpc_mode = config->hpc;
+  if (hpc_mode)
+    spdlog::info("HPC mode: reads will be homopolymer-compressed before search");
   if (config->bam != "") {
     bam_file = hts_open(config->bam.c_str(), "r");
     bam_header = sam_hdr_read(bam_file);
