@@ -56,6 +56,7 @@ Configuration::Configuration()
     ("noassemble", "", cxxopts::value<bool>()->default_value("false"))
     ("noputative", "", cxxopts::value<bool>()->default_value("false"))
     ("hpc", "", cxxopts::value<bool>()->default_value("false"))
+    ("hpc-cap", "", cxxopts::value<int>())
     ("binary", "", cxxopts::value<bool>()->default_value("false"))
     ("version", "Print version information.")
     ("h,help", "Print this help.")
@@ -123,6 +124,8 @@ void Configuration::parse(int argc, char **argv) {
   assemble = !(results["noassemble"].as<bool>());
   putative = !(results["noputative"].as<bool>());
   hpc = results["hpc"].as<bool>();
+  if (results.count("hpc-cap"))
+    hpc_cap = results["hpc-cap"].as<int>();
   version = results["version"].as<bool>();
   verbose = results["verbose"].as<bool>();
   help = results["help"].as<bool>();

@@ -37,28 +37,44 @@ void destroy_chromosomes() {
 }
 
 int hpc_compress_nt6(const uint8_t *src, int len, uint8_t *dst,
-                     int *hpc_to_orig) {
+                     int *hpc_to_orig, int cap) {
+  if (cap < 1)
+    cap = 1;
   if (len <= 0) {
     hpc_to_orig[0] = 0;
     return 0;
   }
   int j = 0;
-  dst[0] = src[0];
-  hpc_to_orig[0] = 0;
-  for (int i = 1; i < len; ++i) {
-    if (src[i] != src[i - 1]) {
+  int i = 0;
+  while (i < len) {
+    int run_start = i;
+    uint8_t c = src[i];
+    int run_end = i + 1;
+    while (run_end < len && src[run_end] == c)
+      ++run_end;
+    int run_len = run_end - run_start;
+    int keep = run_len < cap ? run_len : cap;
+    // Emit `keep` copies. The first keep-1 each own one original position; the
+    // last one owns the remaining tail of the run, so the slices stay
+    // contiguous and the sentinel below closes the partition.
+    for (int t = 0; t < keep; ++t) {
+      dst[j] = c;
+      hpc_to_orig[j] = run_start + t;
       ++j;
-      dst[j] = src[i];
-      hpc_to_orig[j] = i;
     }
+    i = run_end;
   }
-  int hpc_len = j + 1;
+  int hpc_len = j;
   hpc_to_orig[hpc_len] = len; // sentinel: one past the end of the last run
   return hpc_len;
 }
 
-void hpc_write_reference_fasta(const string &in_fa, const string &out_fa) {
-  spdlog::info("HPC-compressing reference {} -> {}..", in_fa, out_fa);
+void hpc_write_reference_fasta(const string &in_fa, const string &out_fa,
+                               int cap) {
+  if (cap < 1)
+    cap = 1;
+  spdlog::info("HPC-compressing reference {} -> {} (cap={})..", in_fa, out_fa,
+               cap);
   gzFile fp = gzopen(in_fa.c_str(), "r");
   if (fp == nullptr)
     throw runtime_error("Cannot open reference " + in_fa);
@@ -77,15 +93,21 @@ void hpc_write_reference_fasta(const string &in_fa, const string &out_fa) {
       fprintf(out, ">%s %s\n", seq->name.s, seq->comment.s);
     else
       fprintf(out, ">%s\n", seq->name.s);
-    // HPC-compress in place, uppercased
+    // HPC-compress in place, uppercased: keep at most `cap` copies per run.
     char prev = '\0';
+    int run = 0; // copies of the current run already emitted
     int col = 0;
     int kept = 0;
     for (int i = 0; i < l; ++i) {
       char c = (char)toupper((unsigned char)seq->seq.s[i]);
-      if (c == prev)
-        continue;
-      prev = c;
+      if (c == prev) {
+        if (run >= cap)
+          continue; // run already at cap, drop this base
+        ++run;
+      } else {
+        prev = c;
+        run = 1;
+      }
       fputc(c, out);
       ++kept;
       if (++col == LINE_W) {

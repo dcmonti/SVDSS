@@ -128,7 +128,9 @@ void Caller::run() {
     for (size_t i = 0; i < clipped_svs.size(); i++) {
       const SV &sv = clipped_svs[i];
       if (suppressed[i]) continue;
-      if (abs(sv.l) >= (int)config->min_sv_length) {
+      // BND breakends have no meaningful length (l == 0); exempt them from the
+      // min_sv_length filter, otherwise every translocation is silently dropped.
+      if (sv.type == "BND" || abs(sv.l) >= (int)config->min_sv_length) {
         if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e)) continue;
         cout << sv << endl;
       }
@@ -712,7 +714,7 @@ void Caller::pcall(const vector<Cluster> &clusters) {
       for (const SV &sv : _svs) {
         if (config->require_sfs_overlap &&
             count_overlapping_original_sfs(cluster, cl, sv) <
-                1) {
+                2) {
           spdlog::debug(
               "[CALLER_FILTER][LOW_ORIG_SFS_OVERLAP] chrom={} sv_start={} sv_end={} type={} cluster_interval={}:{}-{}",
               sv.chrom, sv.s, sv.e, sv.type, cluster.chrom, cluster.s,

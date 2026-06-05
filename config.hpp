@@ -37,6 +37,7 @@ static const char SEARCH_USAGE_MESSAGE[] =
   "      --noputative                     when input is smoothed bam, do not filter unsmoothed reads (default: putative)\n"
   "      --noassemble                     do not assemble specific strings overlapping on a read (default: assemble)\n"
   "      --hpc                            homopolymer-compress reads before search; the index must have been built with --hpc\n"
+  "      --hpc-cap <INT>                  cap each homopolymer run at INT copies (default: 1 = full collapse); must match the index\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -87,6 +88,7 @@ public:
   bool assemble = true;
   bool putative = true;
   bool hpc = false; // homopolymer-compressed search (requires HPC-built index)
+  int hpc_cap = 1;  // cap per homopolymer run (1 = full collapse); must match index
   int overlap = -1;
   int max_output = 100000;
   // call

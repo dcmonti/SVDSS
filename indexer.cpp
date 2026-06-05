@@ -39,18 +39,39 @@ void touch_file(const string &p) {
 
 int run_index(int argc, char **argv) {
   bool hpc_mode = false;
+  int hpc_cap = 1;
   string output_fmd;
   string append_idx;
   vector<char *> new_argv;
   vector<string> tmp_files;
   vector<char *> owned_strings; // strdup'd entries we must free
 
+  // Pre-scan for HPC settings so positional FASTA compression below uses the
+  // right cap regardless of argument order.
+  for (int i = 1; i < argc; ++i) {
+    string tok = argv[i];
+    if (tok == "--hpc")
+      hpc_mode = true;
+    else if (tok == "--hpc-cap" && i + 1 < argc)
+      hpc_cap = atoi(argv[i + 1]);
+    else if (tok.rfind("--hpc-cap=", 0) == 0)
+      hpc_cap = atoi(tok.c_str() + 10);
+  }
+  if (hpc_cap < 1)
+    hpc_cap = 1;
+
   new_argv.push_back(argv[0]); // "index"
 
   for (int i = 1; i < argc; ++i) {
     string tok = argv[i];
     if (tok == "--hpc") {
-      hpc_mode = true;
+      continue; // consumed in pre-scan
+    }
+    if (tok == "--hpc-cap") {
+      ++i; // skip the value token too
+      continue;
+    }
+    if (tok.rfind("--hpc-cap=", 0) == 0) {
       continue;
     }
     // option that takes a value (forms: "-X VAL" or "-XVAL")
@@ -93,7 +114,7 @@ int run_index(int argc, char **argv) {
       close(fd);
       string tmp_path(tmpl);
       try {
-        hpc_write_reference_fasta(string(argv[i]), tmp_path);
+        hpc_write_reference_fasta(string(argv[i]), tmp_path, hpc_cap);
       } catch (const std::exception &e) {
         spdlog::critical("HPC compression of {} failed: {}", argv[i], e.what());
         unlink(tmp_path.c_str());
@@ -129,8 +150,9 @@ int run_index(int argc, char **argv) {
         free(s);
       return 1;
     }
-    spdlog::info(
-        "HPC mode: reference inputs homopolymer-compressed before indexing");
+    spdlog::info("HPC mode (cap={}): reference inputs homopolymer-compressed "
+                 "before indexing",
+                 hpc_cap);
   }
 
   spdlog::info("We rely on 'ropebwt3 build' - just exposing it for convenience");

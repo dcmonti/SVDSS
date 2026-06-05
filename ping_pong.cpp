@@ -121,7 +121,7 @@ bool PingPong::load_batch_bam(int p) {
       int hpc_len = hpc_compress_nt6(
           read_seqs[p][nseqs % config->threads][i], (int)l,
           read_seqs_hpc[p][nseqs % config->threads][i],
-          read_seqs_hpc_map[p][nseqs % config->threads][i]);
+          read_seqs_hpc_map[p][nseqs % config->threads][i], config->hpc_cap);
       read_seqs_hpc[p][nseqs % config->threads][i][hpc_len] = '\0';
       read_seqs_hpc_lengths[p][nseqs % config->threads][i] = (uint)hpc_len;
     }
@@ -203,7 +203,7 @@ bool PingPong::load_batch_fastq(int threads, int batch_size, int p) {
       int hpc_len = hpc_compress_nt6(
           read_seqs[p][n % threads][i], (int)l,
           read_seqs_hpc[p][n % threads][i],
-          read_seqs_hpc_map[p][n % threads][i]);
+          read_seqs_hpc_map[p][n % threads][i], config->hpc_cap);
       read_seqs_hpc[p][n % threads][i][hpc_len] = '\0';
       read_seqs_hpc_lengths[p][n % threads][i] = (uint)hpc_len;
     }
@@ -307,7 +307,9 @@ int PingPong::search() {
   // vice versa); we do not infer the index nature from files on disk.
   hpc_mode = config->hpc;
   if (hpc_mode)
-    spdlog::info("HPC mode: reads will be homopolymer-compressed before search");
+    spdlog::info("HPC mode (cap={}): reads will be homopolymer-compressed "
+                 "before search",
+                 config->hpc_cap);
   if (config->bam != "") {
     bam_file = hts_open(config->bam.c_str(), "r");
     bam_header = sam_hdr_read(bam_file);
