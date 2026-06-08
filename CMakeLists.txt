@@ -233,7 +233,7 @@ if (NOT HOLYBUILD)
   target_link_libraries(SVDSS
     PUBLIC lzma
     PUBLIC bz2
-    PUBLIC pthread
+    PUBLIC Threads::Threads
     PUBLIC OpenMP::OpenMP_CXX
   )
 else ()
