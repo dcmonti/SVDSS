@@ -545,7 +545,7 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
 
   int sv_len = abs(sv.l);
   int sv_end = sv.s + sv_len;
-  static const float min_ro = 0.998f;
+  static const float min_ro = 0.95f;
   static const int min_len_diff = 2;
   bam1_t *aln = bam_init1();
   bool germline = false;
