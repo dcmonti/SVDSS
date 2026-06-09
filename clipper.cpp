@@ -438,16 +438,39 @@ void Clipper::call(int threads,
     store_clip_clusters(lclips, rclips);
   }
   _p_svs.resize(threads);
+  // Aggregate clip-cluster statistics (info-level summary at the end).
+  uint min_cw = Configuration::getInstance()->min_cluster_weight;
+  size_t l_above_thr = 0, r_above_thr = 0; // clip clusters with w >= threshold
+  size_t l_with_call = 0, r_with_call = 0; // clip clusters producing >=1 SV
+  for (const Clip &c : lclips)
+    if (c.w >= min_cw)
+      ++l_above_thr;
+  for (const Clip &c : rclips)
+    if (c.w >= min_cw)
+      ++r_above_thr;
   if (lclips.empty() || rclips.empty()) {
+    spdlog::info(
+        "[CLIP_STATS] left clusters: total={} above_weight(>={})={} produced_call=0 | "
+        "right clusters: total={} above_weight(>={})={} produced_call=0",
+        lclips.size(), min_cw, l_above_thr, rclips.size(), min_cw, r_above_thr);
     return;
   }
+  // Each clip produces at most one SV in these loops, so the number of clip
+  // clusters that produced a call equals the total SVs added by the loop.
+  auto total_svs = [&]() {
+    size_t n = 0;
+    for (int t = 0; t < threads; ++t)
+      n += _p_svs[t].size();
+    return n;
+  };
+  size_t svs_before_left = total_svs();
   // Predicting insertions
 #pragma omp parallel for num_threads(threads) schedule(static, 1)
   for (uint i = 0; i < lclips.size(); i++) {
     const Clip &lc = lclips[i];
     int t = omp_get_thread_num();
     string chrom = lc.chrom;
-    
+
     bool sa_used = false;
     if (lc.sa_has_info && lc.sa_query_len > 0) {
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -566,6 +589,8 @@ void Clipper::call(int threads,
       }
     }
   }
+  l_with_call = total_svs() - svs_before_left;
+  size_t svs_before_right = total_svs();
   // Predicting deletions
 #pragma omp parallel for num_threads(threads) schedule(static, 1)
   for (uint i = 0; i < rclips.size(); i++) {
@@ -694,4 +719,10 @@ void Clipper::call(int threads,
       }
     }
   }
+  r_with_call = total_svs() - svs_before_right;
+  spdlog::info(
+      "[CLIP_STATS] left clusters: total={} above_weight(>={})={} produced_call={} | "
+      "right clusters: total={} above_weight(>={})={} produced_call={}",
+      lclips.size(), min_cw, l_above_thr, l_with_call, rclips.size(), min_cw,
+      r_above_thr, r_with_call);
 }

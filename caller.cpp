@@ -594,6 +594,18 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
 
 // Call SVs by POA+realignment
 void Caller::pcall(const vector<Cluster> &clusters) {
+  // Aggregate statistics (info-level summary at the end of the step).
+  size_t n_bed_excluded = 0;   // clusters dropped by the BED filter
+  size_t n_below_weight = 0;   // clusters with size < min_cluster_weight
+  size_t n_passed_weight = 0;  // clusters surviving both filters (eligible)
+  size_t n_with_call = 0;      // clusters that produced >=1 reported SV
+  // Sub-cluster level breakdown of what happens to eligible clusters.
+  size_t n_subclusters = 0;        // sub-clusters produced by the split
+  size_t n_sub_below_weight = 0;   // sub-clusters below threshold after split
+  size_t n_sub_no_sv = 0;          // sub-clusters whose POA yielded no SV >=min_sv_length
+  size_t n_cand_svs = 0;           // candidate SVs from POA (before SV-level filters)
+  size_t n_filt_lowoverlap = 0;    // candidate SVs dropped: low original-SFS overlap
+  size_t n_filt_germline = 0;      // candidate SVs dropped: germline match
 #pragma omp parallel for num_threads(config->threads) schedule(static, 1)
   for (size_t i = 0; i < clusters.size(); i++) {
     int t = omp_get_thread_num();
@@ -603,6 +615,8 @@ void Caller::pcall(const vector<Cluster> &clusters) {
       spdlog::debug(
           "[CALLER_FILTER][BED_EXCLUSION] chrom={} interval={}-{} reads={}",
           cluster.chrom, cluster.s, cluster.e, cluster.size());
+#pragma omp atomic
+      ++n_bed_excluded;
       continue;
     }
 
@@ -611,8 +625,13 @@ void Caller::pcall(const vector<Cluster> &clusters) {
           "[CALLER_FILTER][MIN_CLUSTER_WEIGHT] chrom={} interval={} reads={} threshold={}",
           cluster.chrom, cluster.s, cluster.e, cluster.size(),
           config->min_cluster_weight);
+#pragma omp atomic
+      ++n_below_weight;
       continue;
     }
+#pragma omp atomic
+    ++n_passed_weight;
+    size_t svs_before = _p_svs[t].size(); // to detect if this cluster calls
     string chrom = cluster.chrom;
 
     const vector<Cluster> &subclusters = split_cluster(cluster);
@@ -623,9 +642,11 @@ void Caller::pcall(const vector<Cluster> &clusters) {
       split_sizes += to_string(sub.size());
     }
     spdlog::debug(
-        "[CALLER_SPLIT][RESULT] chrom={} interval={} original_reads={} subclusters={} sizes={}",
+        "[CALLER_SPLIT][RESULT] chrom={} interval={}-{} original_reads={} subclusters={} sizes={}",
         cluster.chrom, cluster.s, cluster.e, cluster.size(), subclusters.size(),
         split_sizes);
+#pragma omp atomic
+    n_subclusters += subclusters.size();
 
     // Calling from one or two clusters
     for (const Cluster &cl : subclusters) {
@@ -634,6 +655,8 @@ void Caller::pcall(const vector<Cluster> &clusters) {
             "[CALLER_FILTER][MIN_CLUSTER_WEIGHT_POST_SPLIT] chrom={} interval={} subcluster_reads={} threshold={}",
             cluster.chrom, cluster.s, cluster.e, cl.size(),
             config->min_cluster_weight);
+#pragma omp atomic
+        ++n_sub_below_weight;
       }
 
       vector<SV> _svs;
@@ -705,6 +728,13 @@ void Caller::pcall(const vector<Cluster> &clusters) {
           rpos += l;
         }
       }
+      if (_svs.empty()) {
+#pragma omp atomic
+        ++n_sub_no_sv;
+      } else {
+#pragma omp atomic
+        n_cand_svs += _svs.size();
+      }
       for (size_t v = 0; v < _svs.size(); v++) {
         _svs[v].ngaps = nv;
         _svs[v].set_gt("./.", 100);
@@ -719,12 +749,16 @@ void Caller::pcall(const vector<Cluster> &clusters) {
               "[CALLER_FILTER][LOW_ORIG_SFS_OVERLAP] chrom={} sv_start={} sv_end={} type={} cluster_interval={}:{}-{}",
               sv.chrom, sv.s, sv.e, sv.type, cluster.chrom, cluster.s,
               cluster.e);
+#pragma omp atomic
+          ++n_filt_lowoverlap;
           continue;
         }
         if (_p_normal_bam && is_germline(sv, chrom, cl.s, cl.e, t)) {
           spdlog::debug(
               "[CALLER_FILTER][GERMLINE] chrom={} sv_start={} sv_end={} type={} len={}",
               sv.chrom, sv.s, sv.e, sv.type, sv.l);
+#pragma omp atomic
+          ++n_filt_germline;
           // Record the germline region so that clip-based calls near this
           // event are also suppressed by filter_tooclose_clips().
           _p_germline_regions[t].push_back(
@@ -734,7 +768,23 @@ void Caller::pcall(const vector<Cluster> &clusters) {
         _p_svs[t].push_back(sv);
       }
     }
+    if (_p_svs[t].size() > svs_before) {
+#pragma omp atomic
+      ++n_with_call;
+    }
   }
+  spdlog::info(
+      "[CALLER_STATS] clusters: total={} bed_excluded={} below_weight(<{})={} "
+      "passed_weight={} produced_call={}",
+      clusters.size(), n_bed_excluded, config->min_cluster_weight,
+      n_below_weight, n_passed_weight, n_with_call);
+  spdlog::info(
+      "[CALLER_STATS] subclusters: total={} below_weight_post_split={} "
+      "no_sv_from_poa={} | candidate_svs={} filtered_lowoverlap={} "
+      "filtered_germline={} kept={}",
+      n_subclusters, n_sub_below_weight, n_sub_no_sv, n_cand_svs,
+      n_filt_lowoverlap, n_filt_germline,
+      n_cand_svs - n_filt_lowoverlap - n_filt_germline);
 }
 
 int Caller::count_overlapping_original_sfs(const Cluster &cluster,
