@@ -791,6 +791,7 @@ void Caller::pcall(const vector<Cluster> &clusters) {
             config->min_cluster_weight);
 #pragma omp atomic
         ++n_sub_below_weight;
+        continue; // subcluster below threshold: discard, do not call
       }
 
       vector<SV> _svs;
