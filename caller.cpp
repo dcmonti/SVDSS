@@ -1,5 +1,9 @@
 #include "caller.hpp"
 
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 void Caller::run() {
   config = Configuration::getInstance();
 
@@ -39,16 +43,8 @@ void Caller::run() {
   _p_germline_regions.resize(config->threads);
   pcall(C.clusters);
 
-  if (_p_normal_bam) {
-    for (int i = 0; i < config->threads; i++) {
-      sam_hdr_destroy(_p_normal_hdr[i]);
-      hts_idx_destroy(_p_normal_idx[i]);
-      sam_close(_p_normal_bam[i]);
-    }
-    delete[] _p_normal_bam; _p_normal_bam = nullptr;
-    delete[] _p_normal_idx; _p_normal_idx = nullptr;
-    delete[] _p_normal_hdr; _p_normal_hdr = nullptr;
-  }
+  // NOTE: the normal-contigs BAM is kept open here; it is also used by the
+  // germline filter on the clipped-SFS calls below, and freed afterwards.
   for (int i = 0; i < config->threads; i++) {
     svs.insert(svs.begin(), _p_svs[i].begin(), _p_svs[i].end());
     alignments.insert(alignments.begin(), _p_alignments[i].begin(),
@@ -132,9 +128,25 @@ void Caller::run() {
       // min_sv_length filter, otherwise every translocation is silently dropped.
       if (sv.type == "BND" || abs(sv.l) >= (int)config->min_sv_length) {
         if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e)) continue;
+        // Germline filter on every clipped event (INS/DEL/DUP via CIGAR I/D,
+        // BND/INV via the normal contigs' split alignments). Serial loop → t=0.
+        if (_p_normal_bam &&
+            is_germline(sv, sv.chrom, sv.s > 50 ? sv.s - 50 : 0, sv.e + 50, 0))
+          continue;
         cout << sv << endl;
       }
     }
+  }
+
+  if (_p_normal_bam) {
+    for (int i = 0; i < config->threads; i++) {
+      sam_hdr_destroy(_p_normal_hdr[i]);
+      hts_idx_destroy(_p_normal_idx[i]);
+      sam_close(_p_normal_bam[i]);
+    }
+    delete[] _p_normal_bam; _p_normal_bam = nullptr;
+    delete[] _p_normal_idx; _p_normal_idx = nullptr;
+    delete[] _p_normal_hdr; _p_normal_hdr = nullptr;
   }
 
   destroy_chromosomes();
@@ -524,6 +536,10 @@ string Caller::run_poa(const vector<string> &seqs) {
 // All fully-covering contigs are checked to account for multiple alleles.
 bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
                          int t) {
+  // Breakend-like events are not represented as CIGAR I/D ops in the normal
+  // contigs; check their split (SA) alignments instead.
+  if (sv.type == "BND" || sv.type == "INV")
+    return is_germline_breakend(sv, t);
   string region = chrom + ":" + to_string(cl_s) + "-" + to_string(cl_e);
   hts_itr_t *itr =
       sam_itr_querys(_p_normal_idx[t], _p_normal_hdr[t], region.c_str());
@@ -558,7 +574,10 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
           bam_op == BAM_CDIFF) {
         rpos += l;
       } else if (bam_op == BAM_CINS || bam_op == BAM_CDEL) {
-        bool type_match = (bam_op == BAM_CINS) ? (sv.type == "INS")
+        // A germline tandem duplication appears as an insertion (extra copy) in
+        // the normal contig, so DUP is matched against contig I ops like INS.
+        bool type_match = (bam_op == BAM_CINS) ? (sv.type == "INS" ||
+                                                  sv.type == "DUP")
                                                : (sv.type == "DEL");
         if (type_match && (int)l >= (int)config->min_sv_length) {
           // SV interval: [sv.s, sv.s + sv_len]
@@ -587,6 +606,111 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
     }
   }
 
+  bam_destroy1(aln);
+  hts_itr_destroy(itr);
+  return germline;
+}
+
+// Germline check for breakend-like events (BND, INV). A germline rearrangement
+// makes the normal contigs split: a contig is clipped at the breakpoint and its
+// SA tag points to the partner region. We confirm germline if some normal contig
+// near the SV breakpoint has an SA reaching the partner:
+//   - BND: SA on the mate chromosome covering the mate position (parsed from the
+//          breakend ALT, e.g. "N]chr5:1234]" / "C[chr5:1234[").
+//   - INV: SA on the same chromosome, opposite strand, covering the other
+//          breakpoint (sv.s + |sv.l|).
+bool Caller::is_germline_breakend(const SV &sv, int t) {
+  if (!_p_normal_bam || !_p_normal_idx[t] || !_p_normal_hdr[t])
+    return false;
+
+  string mate_chrom;
+  long mate_pos = -1;
+  bool want_strand_flip = false;
+  if (sv.type == "INV") {
+    mate_chrom = sv.chrom;
+    mate_pos = (long)sv.s + abs(sv.l);
+    want_strand_flip = true;
+  } else { // BND: parse "chrom:pos" inside the bracket notation of altall
+    size_t lb = sv.altall.find_first_of("[]");
+    size_t rb = sv.altall.find_first_of("[]", lb + 1);
+    if (lb == string::npos || rb == string::npos)
+      return false;
+    string inside = sv.altall.substr(lb + 1, rb - lb - 1); // chrom:pos
+    size_t colon = inside.rfind(':');
+    if (colon == string::npos)
+      return false;
+    mate_chrom = inside.substr(0, colon);
+    try {
+      mate_pos = stol(inside.substr(colon + 1));
+    } catch (...) {
+      return false;
+    }
+  }
+  if (mate_pos < 0)
+    return false;
+
+  const int W = 500; // position tolerance (contig vs read, HPC, breakpoint)
+  int qs = sv.s > W ? sv.s - W : 0;
+  string region =
+      sv.chrom + ":" + to_string(qs) + "-" + to_string(sv.s + W);
+  hts_itr_t *itr =
+      sam_itr_querys(_p_normal_idx[t], _p_normal_hdr[t], region.c_str());
+  if (!itr)
+    return false;
+
+  bam1_t *aln = bam_init1();
+  bool germline = false;
+  while (!germline && sam_itr_next(_p_normal_bam[t], itr, aln) > 0) {
+    if (aln->core.flag & BAM_FSECONDARY)
+      continue;
+    uint8_t *sa_tag = bam_aux_get(aln, "SA");
+    if (sa_tag == NULL)
+      continue;
+    bool contig_reverse = (aln->core.flag & BAM_FREVERSE) != 0;
+    // Each SA entry: "chrom,pos,strand,CIGAR,mapQ,NM;"
+    string sa(bam_aux2Z(sa_tag));
+    size_t s = 0;
+    while (!germline && s < sa.size()) {
+      size_t e = sa.find(';', s);
+      if (e == string::npos)
+        break;
+      string entry = sa.substr(s, e - s);
+      s = e + 1;
+      // split the 6 comma fields
+      size_t c1 = entry.find(','), c2 = entry.find(',', c1 + 1),
+             c3 = entry.find(',', c2 + 1), c4 = entry.find(',', c3 + 1);
+      if (c1 == string::npos || c2 == string::npos || c3 == string::npos ||
+          c4 == string::npos)
+        continue;
+      string sa_chrom = entry.substr(0, c1);
+      long sa_pos;
+      try {
+        sa_pos = stol(entry.substr(c1 + 1, c2 - c1 - 1));
+      } catch (...) {
+        continue;
+      }
+      bool sa_reverse = (entry[c2 + 1] == '-');
+      // reference span of the SA from its CIGAR (M/=/X/D/N consume reference)
+      string sa_cigar = entry.substr(c3 + 1, c4 - c3 - 1);
+      long sa_ref_len = 0, num = 0;
+      for (char ch : sa_cigar) {
+        if (isdigit((unsigned char)ch))
+          num = num * 10 + (ch - '0');
+        else {
+          if (ch == 'M' || ch == '=' || ch == 'X' || ch == 'D' || ch == 'N')
+            sa_ref_len += num;
+          num = 0;
+        }
+      }
+      if (sa_chrom != mate_chrom)
+        continue;
+      if (want_strand_flip && (sa_reverse == contig_reverse))
+        continue;
+      // does the SA alignment reach the partner breakpoint?
+      if (sa_pos - W <= mate_pos && mate_pos <= sa_pos + sa_ref_len + W)
+        germline = true;
+    }
+  }
   bam_destroy1(aln);
   hts_itr_destroy(itr);
   return germline;

@@ -112,6 +112,9 @@ private:
 
   bool is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
                    int t);
+  // Germline check for breakend-like events (BND/INV) using the split (SA)
+  // alignments of the normal contigs instead of CIGAR I/D ops.
+  bool is_germline_breakend(const SV &sv, int t);
 
   void print_vcf_header();
 };
