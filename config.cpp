@@ -47,6 +47,7 @@ Configuration::Configuration()
     ("min-cluster-weight", "", cxxopts::value<int>())
     ("max-cluster-dist", "", cxxopts::value<int>())
     ("accp", "", cxxopts::value<float>())
+    ("germline-min-ro", "", cxxopts::value<float>())
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
@@ -109,6 +110,8 @@ void Configuration::parse(int argc, char **argv) {
     min_mapq = results["min-mapq"].as<int>();
   if (results.count("accp"))
     accp = results["accp"].as<float>();
+  if (results.count("germline-min-ro"))
+    germline_min_ro = results["germline-min-ro"].as<float>();
   if (results.count("l"))
     min_ratio = results["l"].as<float>();
   if (results.count("bed-exclusion")) {

@@ -28,6 +28,7 @@ static const char SMOOTH_USAGE_MESSAGE[] =
   "      --min-mapq <INT>                 minimum mapping quality (default: 20)\n"
   "      --min-indel-length <INT>         indels shorter than this are smoothed out (default: 20)\n"
   "      --accp <FLOAT>                   accuracy percentile for alignments filtering (default: 0.98)\n"
+  "      --germline-min-ro <FLOAT>        reciprocal-overlap to call an SV germline vs normal contigs (default: 0.95)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -99,6 +100,10 @@ public:
   int min_indel_length = 20;
   uint min_cluster_weight = 2;
   float min_ratio = 0.97; // FIXME: change name
+  // Reciprocal-overlap threshold for the germline filter: an SV is called
+  // germline if a normal contig carries a matching event with RO >= this.
+  // Lower it to filter more germline (e.g. VNTR length-polymorphisms).
+  float germline_min_ro = 0.95;
   bool useht = true;
   // bool noref = false;
   bool clipped = false;
