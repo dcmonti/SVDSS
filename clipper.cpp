@@ -58,6 +58,7 @@ static void apply_sa_winner(Clip &clip, const SAGroup &w) {
   clip.sa_ref_len = w.sa_ref_len;
   clip.sa_query_start = w.sa_query_start;
   clip.sa_query_len = w.sa_query_len;
+  clip.sa_w = w.count; // reads supporting the winning event
 }
 
 static void append_names(vector<string> &out, const vector<string> &in) {
@@ -473,6 +474,15 @@ void Clipper::call(int threads,
 
     bool sa_used = false;
     if (lc.sa_has_info && lc.sa_query_len > 0) {
+       // Two-stage weight gate. Stage 1 is the primary clip cluster (lc.w).
+       // Stage 2: among the supplementary-alignment groups we already picked the
+       // highest-weight event (lc.sa_w); if that winning event itself does not
+       // reach the threshold the breakend/SV is supported by too few split reads
+       // → discard and do not call (and do not fall through to the paired-clip
+       // fallback, since this is an SA-carrying clip). sa_w <= w, so this also
+       // satisfies stage 1.
+       if (lc.sa_w < Configuration::getInstance()->min_cluster_weight)
+         continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); lc.p is 0-based (htslib) → convert
        uint sa_pos0 = lc.sa_pos > 0 ? lc.sa_pos - 1 : 0;
@@ -611,6 +621,11 @@ void Clipper::call(int threads,
     // For right clips, SA logic is symmetrical.
     bool sa_used = false;
     if (rc.sa_has_info && rc.sa_query_len > 0) {
+       // Two-stage weight gate (see left-clip loop): the winning SA event
+       // (rc.sa_w) must itself reach the threshold, otherwise discard and do
+       // not call. sa_w <= w, so this also satisfies the primary-cluster stage.
+       if (rc.sa_w < Configuration::getInstance()->min_cluster_weight)
+         continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); rc.p is 0-based (htslib) → convert
        uint sa_pos0 = rc.sa_pos > 0 ? rc.sa_pos - 1 : 0;

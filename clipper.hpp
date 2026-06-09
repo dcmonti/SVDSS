@@ -37,7 +37,10 @@ struct Clip {
   uint sa_ref_len;
   uint sa_query_start;
   uint sa_query_len;
- 
+  // Weight of the winning SA group (number of reads supporting the chosen
+  // breakend/event), as opposed to `w` which is the whole primary cluster.
+  uint sa_w = 0;
+
 
   Clip() { w = 0; sa_has_info = false;}
 
