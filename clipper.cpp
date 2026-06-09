@@ -481,7 +481,17 @@ void Clipper::call(int threads,
            sa_used = true;
            if (lc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + lc.p, 1);
-               SV sv = SV("BND", chrom, lc.p, refbase, "<BND>", lc.w, 0, 0, 0, true, 0);
+               // Mate junction position on the partner chromosome. For a left
+               // clip the SA end adjacent to the junction is sa_pos+sa_ref_len
+               // when both map on the same strand, otherwise sa_pos (1-based).
+               bool same_strand = (lc.primary_reverse == lc.sa_reverse);
+               uint mate = same_strand ? (lc.sa_pos + lc.sa_ref_len) : lc.sa_pos;
+               // Left clip: primary lies to the RIGHT of the breakend, so the
+               // mate piece precedes refbase. ']' keeps the mate forward (same
+               // strand), '[' takes it reverse-complemented (opposite strand).
+               string br = same_strand ? "]" : "[";
+               string alt = br + lc.sa_chrom + ":" + to_string(mate) + br + refbase;
+               SV sv = SV("BND", chrom, lc.p, refbase, alt, lc.w, 0, 0, 0, true, 0);
                sv.add_reads(lc.names);
                sv.add_sa_reads(lc.sa_names);
                _p_svs[t].push_back(sv);
@@ -609,7 +619,17 @@ void Clipper::call(int threads,
            sa_used = true;
            if (rc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + rc.p, 1);
-               SV sv = SV("BND", chrom, rc.p, refbase, "<BND>", rc.w, 0, 0, 0, true, 0);
+               // Mate junction position: symmetrical to the left-clip case. For
+               // a right clip the adjacent SA end is sa_pos when both map on the
+               // same strand, otherwise sa_pos+sa_ref_len (1-based).
+               bool same_strand = (rc.primary_reverse == rc.sa_reverse);
+               uint mate = same_strand ? rc.sa_pos : (rc.sa_pos + rc.sa_ref_len);
+               // Right clip: primary lies to the LEFT of the breakend, so the
+               // mate piece follows refbase. '[' keeps the mate forward (same
+               // strand), ']' takes it reverse-complemented (opposite strand).
+               string br = same_strand ? "[" : "]";
+               string alt = refbase + br + rc.sa_chrom + ":" + to_string(mate) + br;
+               SV sv = SV("BND", chrom, rc.p, refbase, alt, rc.w, 0, 0, 0, true, 0);
                sv.add_reads(rc.names);
                sv.add_sa_reads(rc.sa_names);
                _p_svs[t].push_back(sv);
