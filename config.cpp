@@ -48,6 +48,8 @@ Configuration::Configuration()
     ("max-cluster-dist", "", cxxopts::value<int>())
     ("accp", "", cxxopts::value<float>())
     ("germline-min-ro", "", cxxopts::value<float>())
+    ("germline-min-reads", "", cxxopts::value<int>()) // read-based germline: min concordant normal reads
+    ("germline-max-reads", "", cxxopts::value<int>()) // read-based germline: max normal reads examined per SV
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
@@ -112,6 +114,10 @@ void Configuration::parse(int argc, char **argv) {
     accp = results["accp"].as<float>();
   if (results.count("germline-min-ro"))
     germline_min_ro = results["germline-min-ro"].as<float>();
+  if (results.count("germline-min-reads"))
+    germline_min_reads = results["germline-min-reads"].as<int>();
+  if (results.count("germline-max-reads"))
+    germline_max_reads = results["germline-max-reads"].as<int>();
   if (results.count("l"))
     min_ratio = results["l"].as<float>();
   if (results.count("bed-exclusion")) {

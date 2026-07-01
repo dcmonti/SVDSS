@@ -127,7 +127,7 @@ void Caller::run() {
       // BND breakends have no meaningful length (l == 0); exempt them from the
       // min_sv_length filter, otherwise every translocation is silently dropped.
       if (sv.type == "BND" || abs(sv.l) >= (int)config->min_sv_length) {
-        if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e)) continue;
+        if (excluded_by_bed_or_N(sv)) continue;
         // Germline filter on every clipped event. Clipped calls come from a
         // read split (clip+SA), so the germline signal is a normal contig split
         // the same way — checked via the contigs' SA, not CIGAR I/D ops.
@@ -156,7 +156,7 @@ void Caller::run() {
 void Caller::write_vcf() {
   print_vcf_header();
   for (const SV &sv : svs) {
-    if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e)) {
+    if (excluded_by_bed_or_N(sv)) {
       continue;
     }
     cout << sv << endl;
@@ -531,78 +531,154 @@ string Caller::run_poa(const vector<string> &seqs) {
   return cons;
 }
 
-// Returns true if sv is found in at least one normal contig that fully covers
-// [cl_s, cl_e]. The contig's existing BAM CIGAR is parsed directly — no
-// re-alignment needed since contigs are already mapped to the reference.
-// All fully-covering contigs are checked to account for multiple alleles.
+// Read-based germline filter. An SV (INS/DEL) is called germline when at least
+// config.germline_min_reads normal reads carry a concordant indel near the
+// breakpoint: same type and length ratio >= config.germline_min_ro. Only reads
+// with MAPQ >= config.min_mapq (the SVDSS-call threshold) are considered, and at
+// most config.germline_max_reads reads are examined per SV to bound cost in
+// high-depth/repeat loci (early-exit once enough support is found). The normal
+// BAM (config.normal_contigs_bam) may be a normal *reads* BAM; unlike the old
+// contig-CIGAR check this sees per-haplotype/per-allele read evidence that the
+// assembled contigs miss (e.g. VNTR alleles absent from the unitig set).
 bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
                          int t) {
-  string region = chrom + ":" + to_string(cl_s) + "-" + to_string(cl_e);
+  (void)cl_s;
+  (void)cl_e;
+  const int want = (sv.type == "INS") ? BAM_CINS
+                   : (sv.type == "DEL") ? BAM_CDEL
+                                        : -1;
+  if (want == -1)
+    return false; // read-based filter only handles INS/DEL
+
+  int sv_len = abs(sv.l);
+  int sv_end = sv.s + sv_len;
+  const int win = 150; // window around the breakpoint
+  string region = chrom + ":" + to_string(max(0, sv.s - win)) + "-" +
+                  to_string(sv_end + win);
   hts_itr_t *itr =
       sam_itr_querys(_p_normal_idx[t], _p_normal_hdr[t], region.c_str());
   if (!itr)
     return false;
 
-  int sv_len = abs(sv.l);
-  int sv_end = sv.s + sv_len;
-  const float min_ro = config->germline_min_ro;
-  static const int min_len_diff = 2;
+  const float min_ratio_len = config->germline_min_ro;
   bam1_t *aln = bam_init1();
+  int support = 0;  // normal reads carrying a concordant indel
+  int examined = 0; // normal reads passing the flag/MAPQ filter
   bool germline = false;
 
   while (!germline && sam_itr_next(_p_normal_bam[t], itr, aln) > 0) {
-    if (aln->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY))
+    if (aln->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP))
       continue;
-    // Contig must fully cover the SV interval [sv.s, sv.s + sv_len].
-    // Using the cluster boundaries [cl_s, cl_e] is too strict: the cluster
-    // right boundary can be pulled far by unrelated SFS, excluding contigs
-    // that perfectly span the SV but not the whole cluster.
-    if (aln->core.pos > sv.s || (int)(bam_endpos(aln) - 1) < sv_end)
+    if ((int)aln->core.qual < (int)config->min_mapq)
+      continue; // only reads with at least the SVDSS-call min mapq
+    if (++examined > config->germline_max_reads)
+      break; // cap: bound cost in high-depth/repeat loci
+    // read must span the breakpoint to carry the event
+    if (aln->core.pos > sv.s || (int)(bam_endpos(aln) - 1) < sv.s)
       continue;
 
-    // Walk the contig's own CIGAR and check reciprocal interval overlap
-    // between the called SV interval and each contig I/D operation.
     auto cigar_ops = decode_cigar(aln);
     uint rpos = aln->core.pos;
     for (const auto &op : cigar_ops) {
       uint l = op.first;
       int bam_op = op.second;
-      if (bam_op == BAM_CMATCH || bam_op == BAM_CEQUAL ||
-          bam_op == BAM_CDIFF) {
-        rpos += l;
-      } else if (bam_op == BAM_CINS || bam_op == BAM_CDEL) {
-        bool type_match = (bam_op == BAM_CINS) ? (sv.type == "INS")
-                                               : (sv.type == "DEL");
-        if (type_match && (int)l >= (int)config->min_sv_length) {
-          // SV interval: [sv.s, sv.s + sv_len]
-          // contig op interval: [rpos, rpos + l]
-          int overlap = max(0, min((int)sv.s + sv_len, (int)rpos + (int)l) -
-                                  max((int)sv.s, (int)rpos));
-          int max_len = max(sv_len, (int)l);
-          float ro = (max_len > 0) ? (float)overlap / max_len : 0.0f;
-          spdlog::info(
-              "[GERMLINE_CHECK] sv={}:{} type={} sv_len={} | "
-              "contig={} op={} op_rpos={} op_len={} | overlap={} ro={:.4f} threshold={:.4f} -> {}",
-              chrom, sv.s, sv.type, sv_len,
-              bam_get_qname(aln), (bam_op == BAM_CINS ? 'I' : 'D'), rpos, l,
-              overlap, ro, min_ro, (ro >= min_ro ? "GERMLINE" : "no_match"));
-          if (ro >= min_ro || (abs((int)l - sv_len) <= min_len_diff && ro > 0.9f)) {
-            germline = true;
-            break;
-          }
+      bool consumes_ref =
+          (bam_op == BAM_CMATCH || bam_op == BAM_CEQUAL ||
+           bam_op == BAM_CDIFF || bam_op == BAM_CDEL || bam_op == BAM_CREF_SKIP);
+      if (bam_op == want && (int)l >= (int)config->min_sv_length &&
+          (int)rpos >= sv.s - win && (int)rpos <= sv_end + win) {
+        float r = (float)min((int)l, sv_len) / (float)max((int)l, sv_len);
+        if (r >= min_ratio_len) {
+          ++support;
+          break; // one concordant indel per read is enough
         }
-        if (bam_op == BAM_CDEL)
-          rpos += l;
-        // early exit once we are clearly past the SV region
-        if ((int)rpos > sv.s + sv_len + sv_len)
-          break;
       }
+      if (consumes_ref)
+        rpos += l;
+      if ((int)rpos > sv_end + win)
+        break; // past the region
     }
+    if (support >= config->germline_min_reads)
+      germline = true;
   }
+
+  spdlog::debug("[GERMLINE_CHECK] sv={}:{} type={} sv_len={} | normal_examined={} "
+                "concordant={} (min_reads={} min_ratio={:.2f} mapq>={}) -> {}",
+                chrom, sv.s, sv.type, sv_len, examined, support,
+                config->germline_min_reads, min_ratio_len, config->min_mapq,
+                germline ? "GERMLINE" : "somatic");
 
   bam_destroy1(aln);
   hts_itr_destroy(itr);
   return germline;
+}
+
+// True if the reference has an N within +-window bp of a (1-based) position.
+// chromosome_seqs holds 0-based, null-terminated sequences; a missing chrom
+// (e.g. an ALT-contig mate absent from the reference) yields false.
+bool Caller::ref_has_N_near(const string &chrom, long pos, int window) const {
+  auto it = chromosome_seqs.find(chrom);
+  if (it == chromosome_seqs.end() || it->second == nullptr)
+    return false;
+  const char *seq = it->second;
+  long len = (long)strlen(seq);
+  if (len == 0)
+    return false;
+  long c = pos - 1; // 1-based VCF pos -> 0-based index
+  long s = c - window; if (s < 0) s = 0;
+  long e = c + window; if (e > len - 1) e = len - 1;
+  for (long i = s; i <= e; i++)
+    if (seq[i] == 'N' || seq[i] == 'n')
+      return true;
+  return false;
+}
+
+// Parse the mate chrom:pos out of a BND ALT such as "N]chr5:1234]" or
+// "[chr5:1234[T". Returns false for non-BND or unparseable ALTs.
+bool Caller::bnd_mate(const SV &sv, string &mate_chrom, long &mate_pos) const {
+  if (sv.type != "BND")
+    return false;
+  size_t lb = sv.altall.find_first_of("[]");
+  size_t rb = sv.altall.find_first_of("[]", lb + 1);
+  if (lb == string::npos || rb == string::npos)
+    return false;
+  string inside = sv.altall.substr(lb + 1, rb - lb - 1); // chrom:pos
+  size_t colon = inside.rfind(':');
+  if (colon == string::npos)
+    return false;
+  mate_chrom = inside.substr(0, colon);
+  try {
+    mate_pos = stol(inside.substr(colon + 1));
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+// Central exclusion test for a called SV. Drops it when either breakpoint falls
+// in the exclusion bed OR lies within +-100 bp of a reference N gap. For BND
+// both the primary and the mate breakpoint are tested (the bed check historically
+// looked only at the primary end, letting subtelomeric cross-mapping BNDs whose
+// mate lands in a gap slip through).
+bool Caller::excluded_by_bed_or_N(const SV &sv) const {
+  const int NWIN = 100;
+  // primary breakpoint(s): sv.s and sv.e cover both ends of DEL/DUP/INV.
+  if (config->bed_filter.overlaps(sv.chrom, sv.s, sv.e))
+    return true;
+  if (ref_has_N_near(sv.chrom, sv.s, NWIN) ||
+      ref_has_N_near(sv.chrom, sv.e, NWIN))
+    return true;
+  if (sv.type == "BND") {
+    string mc;
+    long mp;
+    if (bnd_mate(sv, mc, mp)) {
+      if (config->bed_filter.overlaps(mc, mp, mp))
+        return true;
+      if (ref_has_N_near(mc, mp, NWIN))
+        return true;
+    }
+  }
+  return false;
 }
 
 // Germline check for clipped-SFS calls (any type). SVDSS called these from a
@@ -800,7 +876,10 @@ void Caller::pcall(const vector<Cluster> &clusters) {
       string consensus = run_poa(cl.get_seqs());
 
       // ksw2 stuff - TODO: move to a separate function
-      int sc_mch = 1, sc_mis = -9, gapo = 16, gape = 2, gapo2 = 41, gape2 = 1;
+      // asm20 scoring (minimap2): match=1 mis=-4 gapo=6,26 gape=2,1.
+      // Matches the map-hifi read aligner; avoids asm10's harsh -9 mismatch
+      // that fragments single insertions in tandem repeats into spurious pairs.
+      int sc_mch = 1, sc_mis = -4, gapo = 6, gape = 2, gapo2 = 26, gape2 = 1;
       int8_t a = (int8_t)sc_mch,
              b = sc_mis < 0 ? (int8_t)sc_mis : -(int8_t)sc_mis; // a>0 and b<0
       int8_t mat[25] = {a, b, b, b, 0, b, a, b, b, 0, b, b, a,
@@ -1008,6 +1087,27 @@ void Caller::filter_sv_chains() {
             prev = sv;
           merged = true;
         }
+      }
+    }
+    // Reciprocal-overlap merge for imprecise (clipped) duplicates of the same
+    // event. The length-ratio gate above is too strict for clipped calls, whose
+    // breakpoints/lengths are approximate: a real DEL detected from both clip
+    // sides can land at slightly different coordinates (length ratio just below
+    // min_ratio) and survive as a redundant call. Here we merge same-type
+    // imprecise SVs whose reference intervals reciprocally overlap (>= 0.7).
+    if (!merged && sv.imprecise && prev.imprecise && sv.type == prev.type &&
+        sv.chrom == prev.chrom) {
+      long long ov = (long long)min(sv.e, prev.e) - (long long)max(sv.s, prev.s);
+      long long un = (long long)max(sv.e, prev.e) - (long long)min(sv.s, prev.s);
+      double ro = (un > 0) ? (double)ov / (double)un : 0.0;
+      if (ov > 0 && ro >= 0.7) {
+        spdlog::debug("[CALLER_CHAIN][RO_MERGE] chrom={} prev_start={} prev_w={} "
+                      "new_start={} new_w={} type={} ro={:.2f} keep={}",
+                      sv.chrom, prev.s, prev.w, sv.s, sv.w, sv.type, ro,
+                      sv.w > prev.w ? "new" : "prev");
+        if (sv.w > prev.w)
+          prev = sv;
+        merged = true;
       }
     }
     if (!merged) {

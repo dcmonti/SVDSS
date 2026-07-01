@@ -100,10 +100,18 @@ public:
   int min_indel_length = 20;
   uint min_cluster_weight = 2;
   float min_ratio = 0.97; // FIXME: change name
-  // Reciprocal-overlap threshold for the germline filter: an SV is called
-  // germline if a normal contig carries a matching event with RO >= this.
-  // Lower it to filter more germline (e.g. VNTR length-polymorphisms).
+  // Length-concordance threshold for the germline filter: an SV is called
+  // germline if normal reads (or contigs) carry a matching event whose length
+  // ratio with the SV is >= this. Lower it to filter more germline (e.g. VNTR
+  // length-polymorphisms).
   float germline_min_ro = 0.95;
+  // Read-based germline filter: minimum number of concordant normal reads to
+  // declare an SV germline, and the maximum number of normal reads examined per
+  // SV (bounds cost in high-depth/repeat loci). Reads below min_mapq are
+  // skipped. The filter queries config.normal_contigs_bam, which may point at a
+  // normal *reads* BAM instead of contigs.
+  int germline_min_reads = 2;
+  int germline_max_reads = 500;
   bool useht = true;
   // bool noref = false;
   bool clipped = false;

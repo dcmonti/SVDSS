@@ -116,6 +116,15 @@ private:
   // alignments of the normal contigs instead of CIGAR I/D ops.
   bool is_germline_breakend(const SV &sv, int t);
 
+  // True if the reference carries an N within +-window bp of pos on chrom
+  // (0-based access into chromosome_seqs; pos is the 1-based VCF position).
+  bool ref_has_N_near(const string &chrom, long pos, int window) const;
+  // Parse a BND ALT ("N]chr5:1234]") into mate chrom/pos. False if not a BND.
+  bool bnd_mate(const SV &sv, string &mate_chrom, long &mate_pos) const;
+  // Combined exclusion: bed overlap or N-proximity at the primary breakpoint
+  // (and, for BND, at the mate breakpoint too).
+  bool excluded_by_bed_or_N(const SV &sv) const;
+
   void print_vcf_header();
 };
 

@@ -525,11 +525,11 @@ void Clipper::call(int threads,
            // the primary. So the reference gap is: primary_start − SA_end, for both strands.
            long long diff = (long long)lc.p - (long long)(sa_pos0 + lc.sa_ref_len);
 
-           uint s = min(lc.p, sa_pos0);
-           string refbase(chromosome_seqs[chrom] + s, 1);
-
            if (diff < 0) {
-               // DUP
+               // DUP — duplicated interval spans the primary/SA overlap. Geometry
+               // differs from DEL/INS; left unchanged (its own coordinate handling).
+               uint s = min(lc.p, sa_pos0);
+               string refbase(chromosome_seqs[chrom] + s, 1);
                long long jump = -diff;
                if (jump >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
@@ -539,7 +539,13 @@ void Clipper::call(int threads,
                    _p_svs[t].push_back(sv);
                }
            } else {
-               // DEL or INS
+               // DEL or INS. The breakpoint adjacent to the junction is the SA
+               // segment END (sa_pos0 + sa_ref_len), NOT the SA start: the SA start
+               // scatters with the per-read clip length, so using it places the
+               // event ~sa_ref_len bp upstream of where the reads actually clip,
+               // producing a shifted phantom duplicate of the right-clip call.
+               uint j = sa_pos0 + lc.sa_ref_len;
+               string refbase(chromosome_seqs[chrom] + j, 1);
                // dR = reference gap between the two split alignments
                uint dR = (uint)diff;
                // dQ = inner unaligned query bases = clip minus SA-covered query bases
@@ -551,7 +557,7 @@ void Clipper::call(int threads,
                    uint l = dR - dQ;
                    if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       SV sv = SV("DEL", chrom, s, refbase, "<DEL>", lc.w, 0, 0, 0, true, l);
+                       SV sv = SV("DEL", chrom, j, refbase, "<DEL>", lc.w, 0, 0, 0, true, l);
                        sv.add_reads(lc.names);
                        sv.add_sa_reads(lc.sa_names);
                        _p_svs[t].push_back(sv);
@@ -561,7 +567,7 @@ void Clipper::call(int threads,
                    uint l = dQ - dR;
                    if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       SV sv = SV("INS", chrom, s, refbase, "<INS>", lc.w, 0, 0, 0, true, l);
+                       SV sv = SV("INS", chrom, j, refbase, "<INS>", lc.w, 0, 0, 0, true, l);
                        sv.add_reads(lc.names);
                        sv.add_sa_reads(lc.sa_names);
                        _p_svs[t].push_back(sv);
