@@ -191,7 +191,7 @@ bool Clusterer::load_batch(int p) {
     }
     if (aln->core.flag & BAM_FUNMAP || aln->core.flag & BAM_FSUPPLEMENTARY ||
         aln->core.flag & BAM_FSECONDARY) {
-      spdlog::warn("Non primary alignment.. Is bam file smoothed?");
+      spdlog::debug("Non primary alignment.. Is bam file smoothed?");
       continue;
     }
     if (aln->core.qual < config->min_mapq)

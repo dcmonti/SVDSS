@@ -18,23 +18,45 @@ struct SAGroup {
   bool primary_reverse;
   bool sa_reverse;
   uint count;
+  uint junction; // SA coordinate adjacent to the clip junction (vote key)
 };
+
+// Coordinate on the SA (partner) segment that sits at the clip junction and is
+// therefore consistent across reads of the same event. For a same-strand split
+// the left clip's junction is the SA segment END and the right clip's is the SA
+// START: a left clip's SA *start* scatters with the per-read clip length, which
+// would otherwise fragment the votes of a single tandem-DUP breakend into many
+// singleton groups. Opposite-strand / cross-chrom clips keep the SA start (the
+// mate anchor, which does not scatter this way).
+static uint sa_junction(const Clip &c) {
+  if (c.sa_chrom == c.chrom && c.primary_reverse == c.sa_reverse)
+    return c.starting ? (c.sa_pos + c.sa_ref_len) : c.sa_pos;
+  return c.sa_pos;
+}
 
 static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
   if (!c.sa_has_info)
     return;
-  uint w = c.w > 0 ? c.w : 1;
+  // Weight the SA vote by the number of reads that actually carry this SA (the
+  // split-read support for the breakend), NOT the clip-cluster size c.w. A
+  // mappability-boundary clip pile-up can stack dozens of reads that softclip at
+  // the same reference position for unrelated reasons; if only one of them
+  // carries the breakend's SA, using c.w would let that single split read
+  // inherit the whole pile-up's weight and clear the min-cluster-weight gate,
+  // emitting a high-WEIGHT phantom SV. sa_names holds exactly the SA-carrying
+  // reads, so its size is the true breakend support.
+  uint w = c.sa_names.size() > 0 ? (uint)c.sa_names.size() : 1;
+  uint jc = sa_junction(c);
   for (SAGroup &g : groups) {
     if (g.sa_chrom == c.sa_chrom && g.primary_reverse == c.primary_reverse &&
         g.sa_reverse == c.sa_reverse &&
-        (uint)abs((long long)g.sa_pos - (long long)c.sa_pos) <=
-            SA_VOTE_POS_TOL) {
+        (uint)abs((long long)g.junction - (long long)jc) <= SA_VOTE_POS_TOL) {
       g.count += w;
       return;
     }
   }
   groups.push_back({c.sa_chrom, c.sa_pos, c.sa_ref_len, c.sa_query_start,
-                    c.sa_query_len, c.primary_reverse, c.sa_reverse, w});
+                    c.sa_query_len, c.primary_reverse, c.sa_reverse, w, jc});
 }
 
 static bool sa_vote_winner(const vector<SAGroup> &groups, SAGroup &winner) {
@@ -465,6 +487,55 @@ void Clipper::call(int threads,
     return n;
   };
   size_t svs_before_left = total_svs();
+
+  // --- Reciprocal tandem-DUP pooling ---
+  // A tandem DUP surfaces as two independent clip clusters: a left clip at the
+  // DUP start (its SA partner points to the DUP end) and a right clip at the DUP
+  // end (its SA partner points to the DUP start). Because minimap2 splits each
+  // junction read arbitrarily, the split reads are shared between the two
+  // clusters, so neither side alone may reach min_cluster_weight. Detect
+  // reciprocal DUP-voting clusters and pool their SA weights so the combined
+  // evidence can clear the gate. Both loops then emit the same DUP (identical
+  // coordinates), collapsed by the RO>=0.9 dedup in Caller::run().
+  vector<uint> lclip_pool(lclips.size(), 0);
+  vector<uint> rclip_pool(rclips.size(), 0);
+  {
+    const uint RECIP_TOL = 2000; // breakpoint match tolerance (bp)
+    // A same-chrom/same-strand clip whose geometry yields a DUP (diff<0). Sets
+    // `nearp` (the clip-side breakend) and `partner` (the SA-side breakend).
+    auto dup_anchors = [](const Clip &c, bool is_left, uint &nearp,
+                          uint &partner) -> bool {
+      if (!c.sa_has_info || c.sa_query_len == 0) return false;
+      if (c.sa_chrom != c.chrom) return false;
+      if (c.primary_reverse != c.sa_reverse) return false;
+      uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+      long long diff = is_left
+          ? (long long)c.p - (long long)(sa_pos0 + c.sa_ref_len)
+          : (long long)sa_pos0 - (long long)c.p;
+      if (diff >= 0) return false;
+      nearp = c.p;
+      partner = is_left ? (sa_pos0 + c.sa_ref_len) : sa_pos0;
+      return true;
+    };
+    for (uint i = 0; i < lclips.size(); i++) {
+      uint lnear, lpart;
+      if (!dup_anchors(lclips[i], true, lnear, lpart)) continue;
+      for (uint j = 0; j < rclips.size(); j++) {
+        if (rclips[j].chrom != lclips[i].chrom) continue;
+        uint rnear, rpart;
+        if (!dup_anchors(rclips[j], false, rnear, rpart)) continue;
+        // reciprocal: left clip-side == right partner (DUP start) AND
+        //             left partner == right clip-side (DUP end).
+        if ((uint)abs((long long)lnear - (long long)rpart) <= RECIP_TOL &&
+            (uint)abs((long long)lpart - (long long)rnear) <= RECIP_TOL) {
+          uint pooled = lclips[i].sa_w + rclips[j].sa_w;
+          if (pooled > lclip_pool[i]) lclip_pool[i] = pooled;
+          if (pooled > rclip_pool[j]) rclip_pool[j] = pooled;
+        }
+      }
+    }
+  }
+
   // Predicting insertions
 #pragma omp parallel for num_threads(threads) schedule(static, 1)
   for (uint i = 0; i < lclips.size(); i++) {
@@ -481,7 +552,11 @@ void Clipper::call(int threads,
        // → discard and do not call (and do not fall through to the paired-clip
        // fallback, since this is an SA-carrying clip). sa_w <= w, so this also
        // satisfies stage 1.
-       if (lc.sa_w < Configuration::getInstance()->min_cluster_weight)
+       // eff_w folds in reciprocal tandem-DUP pooling: for a DUP-voting clip
+       // that found a reciprocal partner, lclip_pool[i] holds the summed
+       // (left+right) split-read weight; otherwise it is 0 and eff_w == sa_w.
+       uint eff_w = max(lc.sa_w, lclip_pool[i]);
+       if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); lc.p is 0-based (htslib) → convert
@@ -531,9 +606,9 @@ void Clipper::call(int threads,
                uint s = min(lc.p, sa_pos0);
                string refbase(chromosome_seqs[chrom] + s, 1);
                long long jump = -diff;
-               if (jump >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
+               if (jump >= min_sv_len && eff_w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
-                   SV sv = SV("DUP", chrom, s, refbase, "<DUP>", lc.w, 0, 0, 0, true, jump);
+                   SV sv = SV("DUP", chrom, s, refbase, "<DUP>", eff_w, 0, 0, 0, true, jump);
                    sv.add_reads(lc.names);
                    sv.add_sa_reads(lc.sa_names);
                    _p_svs[t].push_back(sv);
@@ -630,7 +705,9 @@ void Clipper::call(int threads,
        // Two-stage weight gate (see left-clip loop): the winning SA event
        // (rc.sa_w) must itself reach the threshold, otherwise discard and do
        // not call. sa_w <= w, so this also satisfies the primary-cluster stage.
-       if (rc.sa_w < Configuration::getInstance()->min_cluster_weight)
+       // eff_w folds in reciprocal tandem-DUP pooling (see left-clip loop).
+       uint eff_w = max(rc.sa_w, rclip_pool[i]);
+       if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); rc.p is 0-based (htslib) → convert
@@ -682,9 +759,9 @@ void Clipper::call(int threads,
            if (diff < 0) {
                // DUP
                long long jump = -diff;
-               if (jump >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
+               if (jump >= min_sv_len && eff_w >= Configuration::getInstance()->min_cluster_weight) {
                    sa_used = true;
-                   SV sv = SV("DUP", chrom, s, refbase, "<DUP>", rc.w, 0, 0, 0, true, jump);
+                   SV sv = SV("DUP", chrom, s, refbase, "<DUP>", eff_w, 0, 0, 0, true, jump);
                    sv.add_reads(rc.names);
                    sv.add_sa_reads(rc.sa_names);
                    _p_svs[t].push_back(sv);
