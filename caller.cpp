@@ -561,6 +561,14 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
     return false;
 
   const float min_ratio_len = config->germline_min_ro;
+  // Difference-based germline test (union with the ratio test). diff_max of 0
+  // means "use min_sv_length" (so it scales with the calling threshold).
+  const int diff_max = config->germline_diff
+                           ? (config->germline_diff_max > 0
+                                  ? config->germline_diff_max
+                                  : (int)config->min_sv_length)
+                           : 0;
+  const int diff_min_len = config->germline_diff_min_len;
   bam1_t *aln = bam_init1();
   int support = 0;  // normal reads carrying a concordant indel
   int examined = 0; // normal reads passing the flag/MAPQ filter
@@ -585,10 +593,18 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
       bool consumes_ref =
           (bam_op == BAM_CMATCH || bam_op == BAM_CEQUAL ||
            bam_op == BAM_CDIFF || bam_op == BAM_CDEL || bam_op == BAM_CREF_SKIP);
-      if (bam_op == want && (int)l >= (int)config->min_sv_length &&
-          (int)rpos >= sv.s - win && (int)rpos <= sv_end + win) {
-        float r = (float)min((int)l, sv_len) / (float)max((int)l, sv_len);
-        if (r >= min_ratio_len) {
+      if (bam_op == want && (int)rpos >= sv.s - win &&
+          (int)rpos <= sv_end + win) {
+        const int nl = (int)l;
+        // Ratio test: normal indel of comparable relative length (>= min_sv_length).
+        const bool ratio_ok =
+            nl >= (int)config->min_sv_length &&
+            (float)min(nl, sv_len) / (float)max(nl, sv_len) >= min_ratio_len;
+        // Difference test: normal indel present but a different number of repeat
+        // units; catches VNTR/low-complexity jitter the ratio test misses.
+        const bool diff_ok = diff_max > 0 && nl >= diff_min_len &&
+                             abs(sv_len - nl) < diff_max;
+        if (ratio_ok || diff_ok) {
           ++support;
           break; // one concordant indel per read is enough
         }

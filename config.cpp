@@ -45,11 +45,15 @@ Configuration::Configuration()
     ("min-indel-length", "", cxxopts::value<int>()) // threshold for smoothing minimum length
     ("min-mapq", "", cxxopts::value<int>())
     ("min-cluster-weight", "", cxxopts::value<int>())
+    ("min-bnd-dist", "", cxxopts::value<int>()) // same-chrom opposite-strand split >= this bp -> BND (0 disables)
     ("max-cluster-dist", "", cxxopts::value<int>())
     ("accp", "", cxxopts::value<float>())
     ("germline-min-ro", "", cxxopts::value<float>())
     ("germline-min-reads", "", cxxopts::value<int>()) // read-based germline: min concordant normal reads
     ("germline-max-reads", "", cxxopts::value<int>()) // read-based germline: max normal reads examined per SV
+    ("germline-diff-max", "", cxxopts::value<int>()) // difference-based germline: |sv_len-normal_len| < this (0=min_sv_length)
+    ("germline-diff-min-len", "", cxxopts::value<int>()) // difference-based germline: min normal-indel length
+    ("no-germline-diff", "", cxxopts::value<bool>()->default_value("false")) // disable difference-based germline test
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
@@ -106,6 +110,8 @@ void Configuration::parse(int argc, char **argv) {
     min_indel_length = results["min-indel-length"].as<int>();
   if (results.count("min-cluster-weight"))
     min_cluster_weight = results["min-cluster-weight"].as<int>();
+  if (results.count("min-bnd-dist"))
+    min_bnd_dist = results["min-bnd-dist"].as<int>();
   if (results.count("max-cluster-dist"))
     max_cluster_dist = results["max-cluster-dist"].as<int>();
   if (results.count("min-mapq"))
@@ -118,6 +124,12 @@ void Configuration::parse(int argc, char **argv) {
     germline_min_reads = results["germline-min-reads"].as<int>();
   if (results.count("germline-max-reads"))
     germline_max_reads = results["germline-max-reads"].as<int>();
+  if (results.count("germline-diff-max"))
+    germline_diff_max = results["germline-diff-max"].as<int>();
+  if (results.count("germline-diff-min-len"))
+    germline_diff_min_len = results["germline-diff-min-len"].as<int>();
+  if (results.count("no-germline-diff") && results["no-germline-diff"].as<bool>())
+    germline_diff = false;
   if (results.count("l"))
     min_ratio = results["l"].as<float>();
   if (results.count("bed-exclusion")) {

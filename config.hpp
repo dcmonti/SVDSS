@@ -57,6 +57,10 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --clipped                        calls SVs from clipped SFS (EXPERIMENTAL)\n"
   "      --no-clipped-fallback            disable paired-clip fallback calls (default: false)\n"
   "      --normal-contigs-bam <FILE>      BAM of normal-tissue contigs aligned to reference for germline filtering\n"
+  "      --germline-min-ro <FLOAT>        length-ratio to call an SV germline vs normal reads (default: 0.95)\n"
+  "      --germline-diff-max <INT>        also call germline if |sv_len - normal_indel_len| < this (0=min_sv_length, default: 0)\n"
+  "      --germline-diff-min-len <INT>    minimum normal-indel length for the difference-based germline test (default: 10)\n"
+  "      --no-germline-diff               disable the difference-based germline test (ratio-only)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -99,6 +103,12 @@ public:
   uint min_mapq = 20;
   int min_indel_length = 20;
   uint min_cluster_weight = 2;
+  // Clipped/SA calling: same-chromosome, OPPOSITE-strand split alignments whose
+  // two ends are at least this far apart (bp) are treated as an intra-chromosomal
+  // translocation and emitted as a BND breakend (like cross-chrom), instead of one
+  // giant INV spanning the whole gap. Same-strand events (DEL/DUP/INS) are never
+  // affected. 0 disables (keep legacy behaviour).
+  uint min_bnd_dist = 5000000;
   float min_ratio = 0.97; // FIXME: change name
   // Length-concordance threshold for the germline filter: an SV is called
   // germline if normal reads (or contigs) carry a matching event whose length
@@ -112,6 +122,17 @@ public:
   // normal *reads* BAM instead of contigs.
   int germline_min_reads = 2;
   int germline_max_reads = 500;
+  // Difference-based germline concordance (union with the ratio test above). A
+  // normal read also counts as concordant when it carries a same-type indel of
+  // length L_n >= germline_diff_min_len with |sv_len - L_n| < germline_diff_max.
+  // This catches VNTR/low-complexity length-jitter that the strict ratio test
+  // misses (normal allele present but a different number of repeat units), while
+  // leaving true somatic events untouched (no normal support at all). Enabled by
+  // default; --no-germline-diff restores the ratio-only behaviour. A
+  // germline_diff_max of 0 means "use min_sv_length" (resolved in Caller).
+  bool germline_diff = true;
+  int germline_diff_max = 0; // 0 -> min_sv_length
+  int germline_diff_min_len = 10;
   bool useht = true;
   // bool noref = false;
   bool clipped = false;

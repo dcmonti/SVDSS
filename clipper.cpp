@@ -288,7 +288,13 @@ void Clipper::store_clip_clusters(const vector<Clip> &lclips,
     string pred_len = ".";
     string diff_s = ".", dR_s = ".", dQ_s = ".";
 
-    if (c.sa_chrom != c.chrom) {
+    uint dump_sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+    uint dump_dist =
+        (c.p > dump_sa_pos0) ? (c.p - dump_sa_pos0) : (dump_sa_pos0 - c.p);
+    uint dump_min_bnd = config->min_bnd_dist;
+    bool dump_opp = (c.primary_reverse != c.sa_reverse);
+    if (c.sa_chrom != c.chrom ||
+        (dump_min_bnd > 0 && dump_opp && dump_dist >= dump_min_bnd)) {
       branch = "BND";
     } else if (c.primary_reverse != c.sa_reverse) {
       branch = "INV";
@@ -561,8 +567,20 @@ void Clipper::call(int threads,
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); lc.p is 0-based (htslib) → convert
        uint sa_pos0 = lc.sa_pos > 0 ? lc.sa_pos - 1 : 0;
-       if (lc.sa_chrom != chrom) {
-           // BND: cross-chrom  consume clip regardless of weight
+       // Same-chrom split alignments farther apart than min_bnd_dist are a
+       // long-range (intra-chromosomal) translocation: emit a BND breakend like
+       // cross-chrom, not one giant INV/DEL/DUP spanning the whole gap.
+       uint intra_dist = (lc.p > sa_pos0) ? (lc.p - sa_pos0) : (sa_pos0 - lc.p);
+       uint min_bnd_dist = Configuration::getInstance()->min_bnd_dist;
+       // Only OPPOSITE-strand long-range junctions become BND: a huge same-strand
+       // event is a genuine DEL/DUP (a 10Mbp deletion must stay a DEL), while a
+       // huge opposite-strand "inversion" is really a translocation junction.
+       bool opp_strand = (lc.primary_reverse != lc.sa_reverse);
+       bool as_bnd = (lc.sa_chrom != chrom) ||
+                     (min_bnd_dist > 0 && opp_strand && intra_dist >= min_bnd_dist);
+       if (as_bnd) {
+           // BND: cross-chrom or long-range intra-chrom translocation.
+           // Consume clip regardless of weight.
            sa_used = true;
            if (lc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + lc.p, 1);
@@ -712,8 +730,20 @@ void Clipper::call(int threads,
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); rc.p is 0-based (htslib) → convert
        uint sa_pos0 = rc.sa_pos > 0 ? rc.sa_pos - 1 : 0;
-       if (rc.sa_chrom != chrom) {
-           // BND: cross-chrom → consume clip regardless of weight
+       // Same-chrom split alignments farther apart than min_bnd_dist are a
+       // long-range (intra-chromosomal) translocation: emit a BND breakend like
+       // cross-chrom, not one giant INV/DEL/DUP spanning the whole gap.
+       uint intra_dist = (rc.p > sa_pos0) ? (rc.p - sa_pos0) : (sa_pos0 - rc.p);
+       uint min_bnd_dist = Configuration::getInstance()->min_bnd_dist;
+       // Only OPPOSITE-strand long-range junctions become BND: a huge same-strand
+       // event is a genuine DEL/DUP (a 10Mbp deletion must stay a DEL), while a
+       // huge opposite-strand "inversion" is really a translocation junction.
+       bool opp_strand = (rc.primary_reverse != rc.sa_reverse);
+       bool as_bnd = (rc.sa_chrom != chrom) ||
+                     (min_bnd_dist > 0 && opp_strand && intra_dist >= min_bnd_dist);
+       if (as_bnd) {
+           // BND: cross-chrom or long-range intra-chrom translocation.
+           // Consume clip regardless of weight.
            sa_used = true;
            if (rc.w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + rc.p, 1);
