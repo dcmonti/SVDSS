@@ -478,7 +478,7 @@ vector<Cluster> Caller::split_cluster(const Cluster &cluster) {
   return out_subclusters;
 }
 
-string Caller::run_poa(const vector<string> &seqs) {
+vector<PoaCons> Caller::run_poa(const vector<string> &seqs) {
   uint n_seqs = seqs.size();
   abpoa_t *ab = abpoa_init();
   abpoa_para_t *abpt = abpoa_init_para();
@@ -489,9 +489,13 @@ string Caller::run_poa(const vector<string> &seqs) {
   abpt->out_msa = 0;
   abpt->out_cons = 1;
   abpt->out_gfa = 0;
-  // abpt->is_diploid = 1; // TODO: maybe this works now
-  // abpt->max_n_cons = 2;
-  // abpt->min_freq = 0.25;
+  // Diploid mode: let abPOA emit up to two consensus sequences (one per allele)
+  // when a heterozygous variant exceeds poa_min_freq. Splits blended VNTR/multi-
+  // allele clusters that a single consensus averages into a phantom size.
+  if (config->diploid_poa) {
+    abpt->max_n_cons = 2;
+    abpt->min_freq = config->poa_min_freq;
+  }
   abpoa_post_set_para(abpt);
 
   // abpt->match = 2;      // match score
@@ -514,21 +518,162 @@ string Caller::run_poa(const vector<string> &seqs) {
 
   abpoa_msa(ab, abpt, n_seqs, NULL, seq_lens, bseqs, NULL, NULL);
   abpoa_cons_t *abc = ab->abc;
-  string cons = ""; // XXX: we may avoid converting to ACGT here since we need
-                    // to reconvert back for ksw2
-  if (abc->n_cons > 0)
-    for (int j = 0; j < abc->cons_len[0]; ++j)
-      cons += "ACGTN"[abc->cons_base[0][j]];
+
+  vector<PoaCons> out;
+  for (int c = 0; c < abc->n_cons; ++c) {
+    PoaCons pc;
+    for (int j = 0; j < abc->cons_len[c]; ++j)
+      pc.seq += "ACGTN"[abc->cons_base[c][j]];
+    // Read membership: abPOA fills clu_read_ids only when it emits >1 consensus;
+    // with a single consensus every read belongs to it.
+    if (abc->n_cons > 1 && abc->clu_n_seq && abc->clu_read_ids) {
+      for (int r = 0; r < abc->clu_n_seq[c]; ++r)
+        pc.read_ids.push_back(abc->clu_read_ids[c][r]);
+    } else {
+      for (uint r = 0; r < n_seqs; ++r)
+        pc.read_ids.push_back((int)r);
+    }
+    out.push_back(std::move(pc));
+  }
 
   for (uint i = 0; i < n_seqs; ++i)
     free(bseqs[i]);
-
   free(bseqs);
   free(seq_lens);
   abpoa_free(ab);
   abpoa_free_para(abpt);
 
-  return cons;
+  // Safeguard: two consensuses that differ in length by less than min_sv_length
+  // cannot yield distinct SVs (the size difference is below what we'd call). We
+  // have no evidence to separate them, so merge into the higher-support one and
+  // pool the reads (full weight). Prevents phantom pairs from spurious 1-2 bp
+  // abPOA splits of unimodal clusters (e.g. the 120-vs-121 bp case).
+  if (out.size() == 2 &&
+      abs((int)out[0].seq.size() - (int)out[1].seq.size()) <
+          (int)config->min_sv_length) {
+    size_t maj = out[0].read_ids.size() >= out[1].read_ids.size() ? 0 : 1;
+    size_t mnr = 1 - maj;
+    out[maj].read_ids.insert(out[maj].read_ids.end(), out[mnr].read_ids.begin(),
+                             out[mnr].read_ids.end());
+    PoaCons keep = std::move(out[maj]);
+    out.clear();
+    out.push_back(std::move(keep));
+  }
+  return out;
+}
+
+// Align query to ref with the SAME ksw2 scoring/mode as the tumor consensus
+// (global, asm20-like: match 1, mis -4, gap 6/26, ext 2/1). Returns the CIGAR as
+// (length, op) pairs with op 0=M, 1=I, 2=D. Re-aligning normal reads through this
+// makes their repeat gap-fragmentation match the tumor side.
+vector<pair<int, int>> Caller::ksw_align(const string &ref, const string &query) {
+  vector<pair<int, int>> ops;
+  uint tl = ref.size(), ql = query.size();
+  if (tl == 0 || ql == 0)
+    return ops;
+  int gapo = 6, gape = 2, gapo2 = 26, gape2 = 1;
+  int8_t a = 1, b = -4;
+  int8_t mat[25] = {a, b, b, b, 0, b, a, b, b, 0, b, b, a,
+                    b, 0, b, b, b, a, 0, 0, 0, 0, 0, 0};
+  uint8_t *ts = (uint8_t *)malloc(tl);
+  uint8_t *qs = (uint8_t *)malloc(ql);
+  for (uint i = 0; i < tl; ++i)
+    ts[i] = _char26_table[(uint8_t)ref[i]];
+  for (uint i = 0; i < ql; ++i)
+    qs[i] = _char26_table[(uint8_t)query[i]];
+  ksw_extz_t ez;
+  memset(&ez, 0, sizeof(ksw_extz_t));
+  ksw_extd2_sse(0, ql, qs, tl, ts, 5, mat, gapo, gape, gapo2, gape2, -1, -1, -1,
+                0, &ez);
+  for (int i = 0; i < ez.n_cigar; ++i)
+    ops.push_back({(int)(ez.cigar[i] >> 4), (int)(ez.cigar[i] & 0xf)});
+  free(ts);
+  free(qs);
+  free(ez.cigar);
+  return ops;
+}
+
+// Re-align a single normal read's window around sv with ksw_align and report
+// whether it carries an indel of sv's type with concordant size. This defeats the
+// minimap2-vs-ksw2 gap-placement mismatch that lets fragmented repeat calls evade
+// the germline filter.
+bool Caller::normal_read_concordant(bam1_t *aln, const string &chrom,
+                                    const SV &sv, int cl_s, int cl_e, int want,
+                                    float min_ratio_len, int diff_max,
+                                    int diff_min_len) {
+  auto it = chromosome_seqs.find(chrom);
+  if (it == chromosome_seqs.end() || it->second == nullptr)
+    return false;
+  const char *cseq = it->second;
+  long clen = (long)strlen(cseq);
+  int sv_len = abs(sv.l);
+  // Align over the SAME window the tumor consensus used ([cl_s, cl_e]) so the
+  // gap fragmentation in repeats is reproduced identically. Sizing the window to
+  // the cluster (not a fixed margin) keeps it tight where clusters are small (so
+  // most reads still span it) and wide only in the long repeats that fragment.
+  long win_s = (long)cl_s;
+  if (win_s < 0)
+    win_s = 0;
+  long win_e = (long)cl_e + 1;
+  if (win_e > clen)
+    win_e = clen;
+  if (win_e <= win_s)
+    return false;
+  // read must fully span the window for a clean local re-alignment
+  if ((long)aln->core.pos > win_s || (long)(bam_endpos(aln) - 1) < win_e - 1)
+    return false;
+
+  // extract the read bases aligned within [win_s, win_e)
+  auto cigar_ops = decode_cigar(aln);
+  uint8_t *qseq = bam_get_seq(aln);
+  long rpos = aln->core.pos; // ref (0-based)
+  long qpos = 0;             // query index
+  string read_win;
+  for (const auto &op : cigar_ops) {
+    int l = op.first, bam_op = op.second;
+    if (bam_op == BAM_CMATCH || bam_op == BAM_CEQUAL || bam_op == BAM_CDIFF) {
+      for (int k = 0; k < l; ++k) {
+        if (rpos >= win_s && rpos < win_e)
+          read_win += seq_nt16_str[bam_seqi(qseq, qpos)];
+        rpos++;
+        qpos++;
+      }
+    } else if (bam_op == BAM_CINS) {
+      if (rpos > win_s && rpos <= win_e)
+        for (int k = 0; k < l; ++k)
+          read_win += seq_nt16_str[bam_seqi(qseq, qpos + k)];
+      qpos += l;
+    } else if (bam_op == BAM_CDEL || bam_op == BAM_CREF_SKIP) {
+      rpos += l;
+    } else if (bam_op == BAM_CSOFT_CLIP) {
+      qpos += l;
+    } // BAM_CHARD_CLIP/PAD: consume nothing
+    if (rpos >= win_e)
+      break;
+  }
+  if (read_win.empty())
+    return false;
+
+  string ref_win(cseq + win_s, win_e - win_s);
+  auto ops2 = ksw_align(ref_win, read_win);
+
+  long rp = win_s; // absolute ref position while walking the re-aligned CIGAR
+  for (const auto &o : ops2) {
+    int l = o.first, op = o.second; // op: 0=M, 1=I(=BAM_CINS), 2=D(=BAM_CDEL)
+    if (op == want) {
+      const int nl = l;
+      const bool ratio_ok =
+          nl >= (int)config->min_sv_length &&
+          (float)min(nl, sv_len) / (float)max(nl, sv_len) >= min_ratio_len;
+      const bool diff_ok = diff_max > 0 && nl >= diff_min_len &&
+                           abs(sv_len - nl) < diff_max;
+      if (ratio_ok || diff_ok)
+        return true;
+    }
+    if (op == 0 || op == BAM_CDEL) // M or D consume reference
+      rp += l;
+  }
+  return false;
 }
 
 // Read-based germline filter. An SV (INS/DEL) is called germline when at least
@@ -542,8 +687,6 @@ string Caller::run_poa(const vector<string> &seqs) {
 // assembled contigs miss (e.g. VNTR alleles absent from the unitig set).
 bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
                          int t) {
-  (void)cl_s;
-  (void)cl_e;
   const int want = (sv.type == "INS") ? BAM_CINS
                    : (sv.type == "DEL") ? BAM_CDEL
                                         : -1;
@@ -585,6 +728,12 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
     if (aln->core.pos > sv.s || (int)(bam_endpos(aln) - 1) < sv.s)
       continue;
 
+    // A read is concordant if its BAM (minimap2) CIGAR carries the indel OR, with
+    // --germline-realign, re-aligning its window with the tumor's ksw2 does. The
+    // realign is ADDITIVE (only a fallback when the BAM scan fails), so it can only
+    // ADD detections (repeat calls the tumor fragments and the map-hifi CIGAR
+    // misses) and never filters fewer reads than the baseline.
+    bool read_concordant = false;
     auto cigar_ops = decode_cigar(aln);
     uint rpos = aln->core.pos;
     for (const auto &op : cigar_ops) {
@@ -605,7 +754,7 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
         const bool diff_ok = diff_max > 0 && nl >= diff_min_len &&
                              abs(sv_len - nl) < diff_max;
         if (ratio_ok || diff_ok) {
-          ++support;
+          read_concordant = true;
           break; // one concordant indel per read is enough
         }
       }
@@ -614,6 +763,12 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
       if ((int)rpos > sv_end + win)
         break; // past the region
     }
+    if (!read_concordant && config->germline_realign &&
+        (cl_e - cl_s) <= config->germline_realign_max_len)
+      read_concordant = normal_read_concordant(
+          aln, chrom, sv, cl_s, cl_e, want, min_ratio_len, diff_max, diff_min_len);
+    if (read_concordant)
+      ++support;
     if (support >= config->germline_min_reads)
       germline = true;
   }
@@ -886,10 +1041,29 @@ void Caller::pcall(const vector<Cluster> &clusters) {
         continue; // subcluster below threshold: discard, do not call
       }
 
-      vector<SV> _svs;
-
       string ref = string(chromosome_seqs[chrom] + cl.s, cl.e - cl.s + 1);
-      string consensus = run_poa(cl.get_seqs());
+      const vector<string> cl_seqs = cl.get_seqs();
+      const vector<string> cl_names = cl.get_names();
+
+      // One iteration per POA consensus. Without diploid_poa this runs once with
+      // all reads (identical to the previous single-consensus behaviour); with
+      // it, a heterozygous cluster yields one iteration per allele, each carrying
+      // only its own reads so weight/germline are computed per allele.
+      for (const PoaCons &pc : run_poa(cl_seqs)) {
+      const int allele_w = (int)pc.read_ids.size();
+      if (allele_w < config->min_cluster_weight) {
+#pragma omp atomic
+        ++n_sub_below_weight;
+        continue; // allele below threshold after splitting
+      }
+      vector<string> allele_names;
+      allele_names.reserve(pc.read_ids.size());
+      for (int _idx : pc.read_ids)
+        if (_idx >= 0 && _idx < (int)cl_names.size())
+          allele_names.push_back(cl_names[_idx]);
+
+      vector<SV> _svs;
+      const string &consensus = pc.seq;
 
       // ksw2 stuff - TODO: move to a separate function
       // asm20 scoring (minimap2): match=1 mis=-4 gapo=6,26 gape=2,1.
@@ -939,8 +1113,8 @@ void Caller::pcall(const vector<Cluster> &clusters) {
                        string(chromosome_seqs[chrom] + rpos - 1, 1),
                        string(chromosome_seqs[chrom] + rpos - 1, 1) +
                            consensus.substr(cpos, l),
-                       cl.size(), cl.cov, nv, score, false, l, cigar_str);
-            sv.add_reads(cl.get_names());
+                       allele_w, cl.cov, nv, score, false, l, cigar_str);
+            sv.add_reads(allele_names);
             _svs.push_back(sv);
             nv++;
           }
@@ -949,9 +1123,9 @@ void Caller::pcall(const vector<Cluster> &clusters) {
           if (l >= config->min_sv_length) {
             SV sv = SV("DEL", cl.chrom, rpos,
                        string(chromosome_seqs[chrom] + rpos - 1, l),
-                       string(chromosome_seqs[chrom] + rpos - 1, 1), cl.size(),
+                       string(chromosome_seqs[chrom] + rpos - 1, 1), allele_w,
                        cl.cov, nv, score, false, l, cigar_str);
-            sv.add_reads(cl.get_names());
+            sv.add_reads(allele_names);
             _svs.push_back(sv);
             nv++;
           }
@@ -997,6 +1171,10 @@ void Caller::pcall(const vector<Cluster> &clusters) {
         }
         _p_svs[t].push_back(sv);
       }
+      free(ts);
+      free(qs);
+      free(ez.cigar); // ksw allocates with km=0 -> standard malloc
+      } // end per-consensus loop
     }
     if (_p_svs[t].size() > svs_before) {
 #pragma omp atomic

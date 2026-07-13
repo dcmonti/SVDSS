@@ -54,6 +54,11 @@ Configuration::Configuration()
     ("germline-diff-max", "", cxxopts::value<int>()) // difference-based germline: |sv_len-normal_len| < this (0=min_sv_length)
     ("germline-diff-min-len", "", cxxopts::value<int>()) // difference-based germline: min normal-indel length
     ("no-germline-diff", "", cxxopts::value<bool>()->default_value("false")) // disable difference-based germline test
+    ("diploid-poa", "", cxxopts::value<bool>()->default_value("false")) // emit up to two POA consensuses per cluster
+    ("poa-min-freq", "", cxxopts::value<float>()) // min allele fraction for diploid-poa split
+    ("germline-realign", "", cxxopts::value<bool>()->default_value("false")) // re-align normal reads with tumor ksw2 for germline test
+    ("germline-realign-margin", "", cxxopts::value<int>()) // flank added to SV window when re-aligning
+    ("germline-realign-max-len", "", cxxopts::value<int>()) // skip realign for SVs larger than this
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
@@ -130,6 +135,16 @@ void Configuration::parse(int argc, char **argv) {
     germline_diff_min_len = results["germline-diff-min-len"].as<int>();
   if (results.count("no-germline-diff") && results["no-germline-diff"].as<bool>())
     germline_diff = false;
+  if (results.count("diploid-poa") && results["diploid-poa"].as<bool>())
+    diploid_poa = true;
+  if (results.count("poa-min-freq"))
+    poa_min_freq = results["poa-min-freq"].as<float>();
+  if (results.count("germline-realign") && results["germline-realign"].as<bool>())
+    germline_realign = true;
+  if (results.count("germline-realign-margin"))
+    germline_realign_margin = results["germline-realign-margin"].as<int>();
+  if (results.count("germline-realign-max-len"))
+    germline_realign_max_len = results["germline-realign-max-len"].as<int>();
   if (results.count("l"))
     min_ratio = results["l"].as<float>();
   if (results.count("bed-exclusion")) {

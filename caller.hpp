@@ -73,6 +73,14 @@ public:
   }
 };
 
+// One POA consensus plus the indices (into the input seqs vector) of the reads
+// that abPOA grouped under it. With diploid_poa a heterozygous cluster yields
+// two PoaCons (one per allele); otherwise a single one carrying all reads.
+struct PoaCons {
+  string seq;
+  vector<int> read_ids;
+};
+
 class Caller {
 
 public:
@@ -96,7 +104,15 @@ private:
 
   vector<Cluster> split_cluster_by_len(const Cluster &);
   vector<Cluster> split_cluster(const Cluster &);
-  string run_poa(const vector<string> &);
+  vector<PoaCons> run_poa(const vector<string> &);
+  // Align query to ref with the same ksw2 scoring/mode as the tumor consensus;
+  // returns the CIGAR as (length, op) pairs (op: 0=M, 1=I, 2=D).
+  vector<pair<int, int>> ksw_align(const string &ref, const string &query);
+  // Re-align a normal read's window around sv with ksw_align and test for a
+  // same-type indel of concordant size (used by --germline-realign).
+  bool normal_read_concordant(bam1_t *aln, const string &chrom, const SV &sv,
+                              int cl_s, int cl_e, int want, float min_ratio_len,
+                              int diff_max, int diff_min_len);
 
   // parallelize
   vector<vector<SV>> _p_svs;

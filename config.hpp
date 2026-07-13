@@ -61,6 +61,10 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --germline-diff-max <INT>        also call germline if |sv_len - normal_indel_len| < this (0=min_sv_length, default: 0)\n"
   "      --germline-diff-min-len <INT>    minimum normal-indel length for the difference-based germline test (default: 10)\n"
   "      --no-germline-diff               disable the difference-based germline test (ratio-only)\n"
+  "      --diploid-poa                    emit up to two POA consensuses per cluster (one per allele; experimental)\n"
+  "      --poa-min-freq <FLOAT>           min allele fraction for --diploid-poa to split a cluster (default: 0.20)\n"
+  "      --germline-realign               re-align normal reads with the tumor's ksw2 for the germline test (experimental)\n"
+  "      --germline-realign-margin <INT>  flank added to the SV window when re-aligning normal reads (default: 300)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -133,6 +137,22 @@ public:
   bool germline_diff = true;
   int germline_diff_max = 0; // 0 -> min_sv_length
   int germline_diff_min_len = 10;
+  // Diploid POA: let abPOA emit up to two consensus sequences (one per allele)
+  // per cluster, so heterozygous/multi-allele VNTR loci are not averaged into a
+  // phantom-size consensus. poa_min_freq is abPOA's min allele fraction to split.
+  // Off by default (experimental).
+  bool diploid_poa = false;
+  float poa_min_freq = 0.20;
+  // Germline re-alignment: for the germline test, align each normal read's local
+  // window with the SAME ksw2 as the tumor consensus instead of reading the BAM's
+  // minimap2 CIGAR. In repeats the two aligners place gaps differently (ksw2
+  // fragments a deletion, minimap2 keeps it whole), so a tumor fragment finds no
+  // match among the BAM CIGARs and evades the filter. Re-aligning makes both
+  // sides fragment identically. Off by default. Skipped for SVs longer than
+  // germline_realign_max_len (window too large to realign cheaply).
+  bool germline_realign = false;
+  int germline_realign_margin = 300; // (unused: window is now the cluster interval)
+  int germline_realign_max_len = 15000; // skip realign when cl_e-cl_s exceeds this
   bool useht = true;
   // bool noref = false;
   bool clipped = false;

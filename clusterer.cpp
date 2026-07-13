@@ -844,7 +844,7 @@ void Clusterer::cluster_by_proximity() {
     size_t total_sfs = 0;
     for (const auto &cl : _interval_sfs_clusters[i])
       total_sfs += cl.second.size();
-    spdlog::info("[CLUSTERING][INTERVAL_DONE_HAC] interval_idx={} chrom={} "
+    spdlog::debug("[CLUSTERING][INTERVAL_DONE_HAC] interval_idx={} chrom={} "
                   "idx_range=[{}-{}] clusters={} sfs={}",
                   i, extended_SFSs[intervals[i].first].chrom,
                   intervals[i].first, intervals[i].second,
