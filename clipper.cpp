@@ -542,6 +542,74 @@ void Clipper::call(int threads,
     }
   }
 
+  // Reciprocal INVERSION pooling. An inversion also has two junctions (one per
+  // breakpoint) and minimap2 splits the junction reads between them, so neither
+  // cluster alone may reach min_cluster_weight — the same failure the tandem-DUP
+  // pooling above fixes. Two differences make the DUP code inapplicable:
+  //   (1) strand: a DUP's split maps same-strand, an inversion's maps opposite;
+  //   (2) shape: the DUP clusters are a left/right pair, whereas the two INV
+  //       clusters are frequently SAME-side (both L or both R), so an lclips x
+  //       rclips loop never pairs them.
+  // Their SA targets also do not point at each other; instead each cluster
+  // independently predicts the SAME inversion interval (via the very formulas
+  // used to emit the SV below: sa_pos for a left clip, sa_pos+sa_ref_len for a
+  // right one). So pair by predicted interval and pool the split-read weights.
+  vector<uint> linv_pool(lclips.size(), 0);
+  vector<uint> rinv_pool(rclips.size(), 0);
+  {
+    const uint INV_TOL = 100; // tolerance on the predicted interval endpoints
+
+    // Predicted inversion interval of an INV-voting clip, mirroring the emission
+    // code: left clip -> target = sa_pos; right clip -> target = sa_pos+sa_ref_len.
+    auto inv_pred = [](const Clip &c, bool is_left, uint &s, uint &e) -> bool {
+      if (!c.sa_has_info || c.sa_query_len == 0) return false;
+      if (c.sa_chrom != c.chrom) return false;
+      if (c.primary_reverse == c.sa_reverse) return false; // INV = opposite strand
+      uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+      uint target = is_left ? sa_pos0 : (sa_pos0 + c.sa_ref_len);
+      s = min(c.p, target);
+      e = max(c.p, target);
+      return e > s; // a degenerate (zero-length) prediction carries no interval
+    };
+
+    // Flatten both sides into one list so L/L, R/R and L/R pairs are all covered.
+    struct InvCand {
+      string chrom;
+      uint s, e, w;
+      bool is_left;
+      uint idx;
+    };
+    vector<InvCand> cand;
+    for (uint i = 0; i < lclips.size(); i++) {
+      uint s, e;
+      if (inv_pred(lclips[i], true, s, e))
+        cand.push_back({lclips[i].chrom, s, e, lclips[i].sa_w, true, i});
+    }
+    for (uint j = 0; j < rclips.size(); j++) {
+      uint s, e;
+      if (inv_pred(rclips[j], false, s, e))
+        cand.push_back({rclips[j].chrom, s, e, rclips[j].sa_w, false, j});
+    }
+
+    for (uint a = 0; a < cand.size(); a++) {
+      for (uint b = a + 1; b < cand.size(); b++) {
+        // Same predicted inversion: same chromosome, both endpoints within tolerance.
+        if (cand[a].chrom != cand[b].chrom)
+          continue;
+        if ((uint)abs((long long)cand[a].s - (long long)cand[b].s) > INV_TOL)
+          continue;
+        if ((uint)abs((long long)cand[a].e - (long long)cand[b].e) > INV_TOL)
+          continue;
+        uint pooled = cand[a].w + cand[b].w;
+        for (const InvCand *c : {&cand[a], &cand[b]}) {
+          uint &slot = c->is_left ? linv_pool[c->idx] : rinv_pool[c->idx];
+          if (pooled > slot)
+            slot = pooled;
+        }
+      }
+    }
+  }
+
   // Predicting insertions
 #pragma omp parallel for num_threads(threads) schedule(static, 1)
   for (uint i = 0; i < lclips.size(); i++) {
@@ -558,10 +626,12 @@ void Clipper::call(int threads,
        // → discard and do not call (and do not fall through to the paired-clip
        // fallback, since this is an SA-carrying clip). sa_w <= w, so this also
        // satisfies stage 1.
-       // eff_w folds in reciprocal tandem-DUP pooling: for a DUP-voting clip
-       // that found a reciprocal partner, lclip_pool[i] holds the summed
-       // (left+right) split-read weight; otherwise it is 0 and eff_w == sa_w.
-       uint eff_w = max(lc.sa_w, lclip_pool[i]);
+       // eff_w folds in reciprocal pooling: for a DUP-voting clip that found a
+       // reciprocal partner, lclip_pool[i] holds the summed (left+right)
+       // split-read weight; linv_pool[i] does the same for an inversion whose
+       // two junction clusters predict the same interval. Both are 0 when no
+       // partner was found, so eff_w falls back to sa_w.
+       uint eff_w = max(lc.sa_w, max(lclip_pool[i], linv_pool[i]));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -604,9 +674,15 @@ void Clipper::call(int threads,
            sa_used = true;
            uint s = min(lc.p, sa_pos0);
            uint l = max(lc.p, sa_pos0) - s;
-           if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
+           // Gate on eff_w, not lc.w: when the inversion's two junction clusters
+           // each hold part of the split-read support, only the pooled weight
+           // reflects the true evidence. Both loops then emit the same INV
+           // (identical coordinates), collapsed by the RO>=0.9 dedup in
+           // Caller::run(), which also picks the higher-WEIGHT copy.
+           uint inv_w = max(lc.w, linv_pool[i]);
+           if (l >= min_sv_len && inv_w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + s, 1);
-               SV sv = SV("INV", chrom, s, refbase, "<INV>", lc.w, 0, 0, 0, true, l);
+               SV sv = SV("INV", chrom, s, refbase, "<INV>", inv_w, 0, 0, 0, true, l);
                sv.add_reads(lc.names);
                sv.add_sa_reads(lc.sa_names);
                _p_svs[t].push_back(sv);
@@ -723,8 +799,8 @@ void Clipper::call(int threads,
        // Two-stage weight gate (see left-clip loop): the winning SA event
        // (rc.sa_w) must itself reach the threshold, otherwise discard and do
        // not call. sa_w <= w, so this also satisfies the primary-cluster stage.
-       // eff_w folds in reciprocal tandem-DUP pooling (see left-clip loop).
-       uint eff_w = max(rc.sa_w, rclip_pool[i]);
+       // eff_w folds in reciprocal DUP and INV pooling (see left-clip loop).
+       uint eff_w = max(rc.sa_w, max(rclip_pool[i], rinv_pool[i]));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -768,9 +844,11 @@ void Clipper::call(int threads,
            uint target_pos = sa_pos0 + rc.sa_ref_len;
            uint s = min(rc.p, target_pos);
            uint l = max(rc.p, target_pos) - s;
-           if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
+           // Gate on the pooled weight (see left-clip loop).
+           uint inv_w = max(rc.w, rinv_pool[i]);
+           if (l >= min_sv_len && inv_w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + s, 1);
-               SV sv = SV("INV", chrom, s, refbase, "<INV>", rc.w, 0, 0, 0, true, l);
+               SV sv = SV("INV", chrom, s, refbase, "<INV>", inv_w, 0, 0, 0, true, l);
                sv.add_reads(rc.names);
                sv.add_sa_reads(rc.sa_names);
                _p_svs[t].push_back(sv);
