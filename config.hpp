@@ -118,14 +118,17 @@ public:
   // germline if normal reads (or contigs) carry a matching event whose length
   // ratio with the SV is >= this. Lower it to filter more germline (e.g. VNTR
   // length-polymorphisms).
-  float germline_min_ro = 0.95;
+  float germline_min_ro = 0.90;
   // Read-based germline filter: minimum number of concordant normal reads to
   // declare an SV germline, and the maximum number of normal reads examined per
   // SV (bounds cost in high-depth/repeat loci). Reads below min_mapq are
   // skipped. The filter queries config.normal_contigs_bam, which may point at a
   // normal *reads* BAM instead of contigs.
-  int germline_min_reads = 2;
-  int germline_max_reads = 500;
+  // min_reads=1: measured on HG008 at both coverages, a single concordant normal
+  // read is enough. 15x len50/w5: FP 28->20 at the cost of 1 TP. 60x len50/w15:
+  // FP 31->27, recall unchanged on the v0.3 PASS truth set.
+  int germline_min_reads = 1;
+  int germline_max_reads = 1000;
   // Difference-based germline concordance (union with the ratio test above). A
   // normal read also counts as concordant when it carries a same-type indel of
   // length L_n >= germline_diff_min_len with |sv_len - L_n| < germline_diff_max.
@@ -140,24 +143,29 @@ public:
   // Diploid POA: let abPOA emit up to two consensus sequences (one per allele)
   // per cluster, so heterozygous/multi-allele VNTR loci are not averaged into a
   // phantom-size consensus. poa_min_freq is abPOA's min allele fraction to split.
-  // Off by default (experimental).
-  bool diploid_poa = false;
+  // On by default; --no-diploid-poa restores the single-consensus behaviour.
+  bool diploid_poa = true;
   float poa_min_freq = 0.20;
   // Germline re-alignment: for the germline test, align each normal read's local
   // window with the SAME ksw2 as the tumor consensus instead of reading the BAM's
   // minimap2 CIGAR. In repeats the two aligners place gaps differently (ksw2
   // fragments a deletion, minimap2 keeps it whole), so a tumor fragment finds no
   // match among the BAM CIGARs and evades the filter. Re-aligning makes both
-  // sides fragment identically. Off by default. Skipped for SVs longer than
-  // germline_realign_max_len (window too large to realign cheaply).
-  bool germline_realign = false;
+  // sides fragment identically. On by default (--no-germline-realign disables).
+  // Additive: it can only mark MORE reads concordant, so it can only remove
+  // calls. Skipped for SVs longer than germline_realign_max_len (window too
+  // large to realign cheaply).
+  bool germline_realign = true;
   int germline_realign_margin = 300; // (unused: window is now the cluster interval)
   int germline_realign_max_len = 15000; // skip realign when cl_e-cl_s exceeds this
   bool useht = true;
   // bool noref = false;
   bool clipped = false;
   bool clipped_fallback = true;
-  bool require_sfs_overlap = false;
+  // Require at least 2 of the original (pre-assembly) SFS to overlap the SV
+  // interval. Applies to the SFS/POA path only — clipped-path SVs carry no SFS
+  // and are never touched. On by default; --no-require-sfs-overlap disables.
+  bool require_sfs_overlap = true;
   int max_cluster_dist = 0; // 0 means auto-computed
 
   string bam = "";

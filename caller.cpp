@@ -36,6 +36,14 @@ void Caller::run() {
                                          config->normal_contigs_bam.c_str());
       _p_normal_hdr[i] = sam_hdr_read(_p_normal_bam[i]);
     }
+  } else {
+    // Every germline knob (min-ro, min-reads, max-reads, diff, realign) reads
+    // the normal BAM, so without --normal-contigs-bam the whole filter is a
+    // no-op. Say so: passing the flags and silently not filtering is worse than
+    // not passing them at all.
+    spdlog::warn("No --normal-contigs-bam: the germline filter is DISABLED and "
+                 "every --germline-* flag is ignored. All calls are reported as "
+                 "somatic.");
   }
 
   _p_svs.resize(config->threads);

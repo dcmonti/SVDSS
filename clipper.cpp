@@ -71,7 +71,8 @@ static bool sa_vote_winner(const vector<SAGroup> &groups, SAGroup &winner) {
   return true;
 }
 
-static void apply_sa_winner(Clip &clip, const SAGroup &w) {
+static void apply_sa_winner(Clip &clip, const SAGroup &w,
+                            const vector<SAGroup> &groups) {
   clip.sa_has_info = true;
   clip.primary_reverse = w.primary_reverse;
   clip.sa_reverse = w.sa_reverse;
@@ -81,6 +82,26 @@ static void apply_sa_winner(Clip &clip, const SAGroup &w) {
   clip.sa_query_start = w.sa_query_start;
   clip.sa_query_len = w.sa_query_len;
   clip.sa_w = w.count; // reads supporting the winning event
+  // Rival groups describing the same breakend must count towards the weight
+  // gate, even though the winner alone dictates the coordinates. Two groups
+  // describe the same breakend when they agree on the SA chromosome and on the
+  // RELATIVE orientation of the two segments (primary_reverse XOR sa_reverse):
+  // that XOR is what tells an inversion from a same-strand event. The two flags
+  // taken separately do not, because a read sequenced from the minus strand
+  // reports the very same junction with both flags mirrored — (F,T) and (T,F)
+  // are the same inversion seen from the two strands, and the vote key splits
+  // them into rivals for no biological reason. What is left to differ inside a
+  // compatible set is where the junction sits, i.e. the jitter the vote key
+  // tolerates only up to SA_VOTE_POS_TOL (and, for an inversion shorter than
+  // the clip-cluster radius, its two junctions).
+  const bool w_opp = (w.primary_reverse != w.sa_reverse);
+  uint total = 0;
+  for (const SAGroup &g : groups) {
+    if (g.sa_chrom == w.sa_chrom &&
+        (g.primary_reverse != g.sa_reverse) == w_opp)
+      total += g.count;
+  }
+  clip.sa_total = total;
 }
 
 static void append_names(vector<string> &out, const vector<string> &in) {
@@ -171,7 +192,7 @@ vector<Clip> Clipper::combine(const vector<Clip> &clips) {
       clip.sa_names = sa_names;
       SAGroup winner;
       if (sa_vote_winner(sa_votes, winner))
-        apply_sa_winner(clip, winner);
+        apply_sa_winner(clip, winner, sa_votes);
       _p_combined_clips[t].push_back(clip);
     }
   }
@@ -239,7 +260,7 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
          it != clusters_by_pos.end(); ++it) {
       SAGroup winner;
       if (sa_vote_winner(sa_votes_by_pos[it->first], winner))
-        apply_sa_winner(it->second, winner);
+        apply_sa_winner(it->second, winner, sa_votes_by_pos[it->first]);
       clusters.push_back(it->second);
     }
   }
@@ -619,19 +640,22 @@ void Clipper::call(int threads,
 
     bool sa_used = false;
     if (lc.sa_has_info && lc.sa_query_len > 0) {
-       // Two-stage weight gate. Stage 1 is the primary clip cluster (lc.w).
-       // Stage 2: among the supplementary-alignment groups we already picked the
-       // highest-weight event (lc.sa_w); if that winning event itself does not
-       // reach the threshold the breakend/SV is supported by too few split reads
-       // → discard and do not call (and do not fall through to the paired-clip
-       // fallback, since this is an SA-carrying clip). sa_w <= w, so this also
-       // satisfies stage 1.
+       // Weight gate on the split-read support of the breakend: if too few reads
+       // carry a supplementary alignment across this junction, discard the clip
+       // (and do not fall through to the paired-clip fallback, since this is an
+       // SA-carrying clip).
+       // The support is sa_total, not the winning group's sa_w: rival groups on
+       // the same chromosome and strand pair are the same breakend placed a few
+       // bp apart (the vote only merges junctions within SA_VOTE_POS_TOL), so
+       // gating on the winner alone throws away real split reads and drops
+       // events that have plenty of them — a 279 bp inversion, whose two
+       // junctions land in two rival groups, is a clean example.
        // eff_w folds in reciprocal pooling: for a DUP-voting clip that found a
        // reciprocal partner, lclip_pool[i] holds the summed (left+right)
        // split-read weight; linv_pool[i] does the same for an inversion whose
        // two junction clusters predict the same interval. Both are 0 when no
-       // partner was found, so eff_w falls back to sa_w.
-       uint eff_w = max(lc.sa_w, max(lclip_pool[i], linv_pool[i]));
+       // partner was found, so eff_w falls back to sa_total.
+       uint eff_w = max(lc.sa_total, max(lclip_pool[i], linv_pool[i]));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -796,11 +820,10 @@ void Clipper::call(int threads,
     // For right clips, SA logic is symmetrical.
     bool sa_used = false;
     if (rc.sa_has_info && rc.sa_query_len > 0) {
-       // Two-stage weight gate (see left-clip loop): the winning SA event
-       // (rc.sa_w) must itself reach the threshold, otherwise discard and do
-       // not call. sa_w <= w, so this also satisfies the primary-cluster stage.
-       // eff_w folds in reciprocal DUP and INV pooling (see left-clip loop).
-       uint eff_w = max(rc.sa_w, max(rclip_pool[i], rinv_pool[i]));
+       // Weight gate on the breakend's split-read support (see left-clip loop):
+       // rc.sa_total, i.e. the winning SA group plus its same-chrom same-strand
+       // rivals, folded together with reciprocal DUP and INV pooling.
+       uint eff_w = max(rc.sa_total, max(rclip_pool[i], rinv_pool[i]));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;

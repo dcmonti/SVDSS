@@ -40,6 +40,14 @@ struct Clip {
   // Weight of the winning SA group (number of reads supporting the chosen
   // breakend/event), as opposed to `w` which is the whole primary cluster.
   uint sa_w = 0;
+  // Split-read support of the whole breakend, i.e. the winning group plus every
+  // rival group that points at the same chromosome with the same strand pair.
+  // The rivals differ from the winner only in where they place the junction, so
+  // they are the same event seen with some jitter (or, for an inversion shorter
+  // than SA_VOTE_POS_TOL*, its second junction). sa_w gives the geometry;
+  // sa_total gives the evidence and is what the weight gate must be compared
+  // against. sa_w <= sa_total <= w.
+  uint sa_total = 0;
 
 
   Clip() { w = 0; sa_has_info = false;}

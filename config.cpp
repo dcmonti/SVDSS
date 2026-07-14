@@ -54,12 +54,15 @@ Configuration::Configuration()
     ("germline-diff-max", "", cxxopts::value<int>()) // difference-based germline: |sv_len-normal_len| < this (0=min_sv_length)
     ("germline-diff-min-len", "", cxxopts::value<int>()) // difference-based germline: min normal-indel length
     ("no-germline-diff", "", cxxopts::value<bool>()->default_value("false")) // disable difference-based germline test
-    ("diploid-poa", "", cxxopts::value<bool>()->default_value("false")) // emit up to two POA consensuses per cluster
+    ("diploid-poa", "", cxxopts::value<bool>()->default_value("false")) // emit up to two POA consensuses per cluster (now ON by default: kept as a no-op for backwards compatibility)
+    ("no-diploid-poa", "", cxxopts::value<bool>()->default_value("false")) // single POA consensus per cluster
     ("poa-min-freq", "", cxxopts::value<float>()) // min allele fraction for diploid-poa split
-    ("germline-realign", "", cxxopts::value<bool>()->default_value("false")) // re-align normal reads with tumor ksw2 for germline test
+    ("germline-realign", "", cxxopts::value<bool>()->default_value("false")) // re-align normal reads with tumor ksw2 for germline test (now ON by default: kept as a no-op for backwards compatibility)
+    ("no-germline-realign", "", cxxopts::value<bool>()->default_value("false")) // germline test on the BAM CIGAR only, no ksw2 fallback
     ("germline-realign-margin", "", cxxopts::value<int>()) // flank added to SV window when re-aligning
     ("germline-realign-max-len", "", cxxopts::value<int>()) // skip realign for SVs larger than this
-    ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // we want at least one original SFS to overlap the SV interval
+    ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // require >=2 original SFS overlapping the SV interval (now ON by default: kept as a no-op for backwards compatibility)
+    ("no-require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // do not require original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
     ("clipped", "", cxxopts::value<bool>()->default_value("false"))
     ("no-clipped-fallback", "", cxxopts::value<bool>()->default_value("false"))
@@ -135,12 +138,16 @@ void Configuration::parse(int argc, char **argv) {
     germline_diff_min_len = results["germline-diff-min-len"].as<int>();
   if (results.count("no-germline-diff") && results["no-germline-diff"].as<bool>())
     germline_diff = false;
-  if (results.count("diploid-poa") && results["diploid-poa"].as<bool>())
-    diploid_poa = true;
+  // diploid_poa, germline_realign and require_sfs_overlap now default to ON.
+  // The old enabling flags stay accepted (no-ops) so existing command lines keep
+  // working; the --no-* counterparts are the way to switch them off.
+  if (results.count("no-diploid-poa") && results["no-diploid-poa"].as<bool>())
+    diploid_poa = false;
   if (results.count("poa-min-freq"))
     poa_min_freq = results["poa-min-freq"].as<float>();
-  if (results.count("germline-realign") && results["germline-realign"].as<bool>())
-    germline_realign = true;
+  if (results.count("no-germline-realign") &&
+      results["no-germline-realign"].as<bool>())
+    germline_realign = false;
   if (results.count("germline-realign-margin"))
     germline_realign_margin = results["germline-realign-margin"].as<int>();
   if (results.count("germline-realign-max-len"))
@@ -154,7 +161,9 @@ void Configuration::parse(int argc, char **argv) {
   binary = results["binary"].as<bool>();
   clipped = results["clipped"].as<bool>();
   clipped_fallback = !results["no-clipped-fallback"].as<bool>();
-  require_sfs_overlap = results["require-sfs-overlap"].as<bool>();
+  if (results.count("no-require-sfs-overlap") &&
+      results["no-require-sfs-overlap"].as<bool>())
+    require_sfs_overlap = false;
   useht = !results["noht"].as<bool>();
   // noref = results["noref"].as<bool>();
   assemble = !(results["noassemble"].as<bool>());
