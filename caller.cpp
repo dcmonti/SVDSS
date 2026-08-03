@@ -4,6 +4,52 @@
 #include <cstdlib>
 #include <string>
 
+// Count primary tumour reads that represent a deletion [s, s+len] as a single
+// CIGAR D op reciprocally overlapping the interval by >= 0.5. These "through"
+// reads are minimap2's non-clipped representation of a < ~15 kbp deletion and
+// are disjoint from the split (clipped) reads of the same event (Mode B).
+uint Caller::count_through_del_reads(samFile *bam, hts_idx_t *idx,
+                                     bam_hdr_t *hdr, const string &chrom, uint s,
+                                     uint len) {
+  int tid = bam_name2id(hdr, chrom.c_str());
+  if (tid < 0)
+    return 0;
+  const long ds_sv = (long)s, de_sv = (long)s + (long)len;
+  hts_itr_t *it = sam_itr_queryi(idx, tid, (int)s, (int)(s + len));
+  if (!it)
+    return 0;
+  bam1_t *aln = bam_init1();
+  uint count = 0;
+  while (sam_itr_next(bam, it, aln) >= 0) {
+    if (aln->core.flag &
+        (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FDUP))
+      continue;
+    if (aln->core.qual < config->min_mapq)
+      continue;
+    const uint32_t *cig = bam_get_cigar(aln);
+    long ref = aln->core.pos;
+    bool hit = false;
+    for (uint k = 0; k < aln->core.n_cigar && !hit; k++) {
+      const int op = bam_cigar_op(cig[k]);
+      const int ol = bam_cigar_oplen(cig[k]);
+      if (op == BAM_CDEL) {
+        const long ds = ref, de = ref + ol;
+        const long ov = min(de_sv, de) - max(ds_sv, ds);
+        const long un = max(de_sv, de) - min(ds_sv, ds);
+        if (ov > 0 && un > 0 && (double)ov / (double)un >= 0.5)
+          hit = true;
+      }
+      if (bam_cigar_type(op) & 2)
+        ref += ol; // op consumes reference
+    }
+    if (hit)
+      ++count;
+  }
+  bam_destroy1(aln);
+  hts_itr_destroy(it);
+  return count;
+}
+
 void Caller::run() {
   config = Configuration::getInstance();
 
@@ -103,6 +149,57 @@ void Caller::run() {
                          clipper._p_svs[i].end());
     }
     spdlog::info("Predicted {} SVs from clipped alignments", s);
+    // Mode B: cross-path rescue. A deletion shorter than ~15 kbp is split by
+    // minimap2 between clips (SA) and through-reads (a single D op); the clip
+    // pooling sees only the clips. Add the read-disjoint through-reads counted
+    // directly on the tumour BAM so a fragmented event can still clear the gate.
+    if (!clipper.prov_dels.empty() && !config->bam.empty()) {
+      samFile *bam = hts_open(config->bam.c_str(), "r");
+      hts_idx_t *idx = bam ? sam_index_load(bam, config->bam.c_str()) : nullptr;
+      bam_hdr_t *hdr = bam ? sam_hdr_read(bam) : nullptr;
+      if (bam && idx && hdr) {
+        uint rescued = 0, germline = 0;
+        for (const ClipDelCand &pc : clipper.prov_dels) {
+          uint n_through =
+              count_through_del_reads(bam, idx, hdr, pc.chrom, pc.s, pc.len);
+          if (pc.clip_w + n_through < config->min_cluster_weight)
+            continue;
+          // Germline veto. A deletion also spanned by through-reads in the
+          // normal contigs is germline. The SA-based clipped germline filter
+          // (is_germline_breakend) is blind to it — through-reads carry no
+          // split — so check the normal's CIGAR D ops the same way we counted
+          // the tumour's. Uses the already-open normal-contigs handles.
+          if (_p_normal_bam &&
+              count_through_del_reads(_p_normal_bam[0], _p_normal_idx[0],
+                                      _p_normal_hdr[0], pc.chrom, pc.s,
+                                      pc.len) >= (uint)config->germline_min_reads) {
+            ++germline;
+            spdlog::debug("[CLIP_MODEB][GERMLINE] {}:{} len={} skipped",
+                          pc.chrom, pc.s, pc.len);
+            continue;
+          }
+          string refbase(chromosome_seqs[pc.chrom] + pc.s, 1);
+          SV sv("DEL", pc.chrom, pc.s, refbase, "<DEL>", pc.clip_w + n_through, 0,
+                0, 0, true, pc.len);
+          sv.add_reads(pc.names);
+          clipped_svs.push_back(sv);
+          ++rescued;
+          spdlog::debug("[CLIP_MODEB] {}:{} len={} clip_w={} through={} -> w={}",
+                        pc.chrom, pc.s, pc.len, pc.clip_w, n_through,
+                        pc.clip_w + n_through);
+        }
+        spdlog::info("[CLIP_MODEB] {}/{} sub-threshold clipped DELs rescued "
+                     "({} vetoed as germline)",
+                     rescued, clipper.prov_dels.size(), germline);
+      } else {
+        spdlog::warn(
+            "[CLIP_MODEB] could not open tumour BAM {}; skipping rescue",
+            config->bam);
+      }
+      if (hdr) bam_hdr_destroy(hdr);
+      if (idx) hts_idx_destroy(idx);
+      if (bam) hts_close(bam);
+    }
     // Deduplicate clipped SVs by reciprocal overlap (RO >= 0.9).
     // Left-clip and right-clip SA paths independently call the same large
     // deletion from opposite breakpoints; RO with max() denominator merges

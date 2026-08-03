@@ -82,6 +82,18 @@ struct Clip {
   bool operator<(const Clip &c) const { return p < c.p; }
 };
 
+// A deletion whose pooled clip evidence is below min_cluster_weight but short
+// enough (< ~15 kbp) that minimap2 may also represent it as through-reads (a
+// single D op) rather than clips. Caller rescues these by counting the
+// read-disjoint through-reads on the tumour BAM (Mode B).
+struct ClipDelCand {
+  string chrom;
+  uint s;
+  uint len;
+  uint clip_w;          // pooled clip-side split-read support (< min_cluster_weight)
+  vector<string> names; // clip read names, carried onto the emitted SV
+};
+
 class Clipper {
 
 private:
@@ -99,6 +111,7 @@ private:
 
 public:
   vector<vector<SV>> _p_svs;
+  vector<ClipDelCand> prov_dels; // sub-threshold DELs for Mode B rescue
 
   Clipper(const vector<Clip> &);
   void call(int threads,

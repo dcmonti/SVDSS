@@ -45,6 +45,11 @@ int run_index(int argc, char **argv) {
   vector<char *> new_argv;
   vector<string> tmp_files;
   vector<char *> owned_strings; // strdup'd entries we must free
+  // In HPC mode every positional FASTA is compressed into this one shared temp
+  // (created lazily on the first positional input), so ropebwt3 build receives
+  // a single input file and can use its overlapped SAIS/merge pipeline.
+  string hpc_tmp_path;
+  bool hpc_tmp_created = false;
 
   // Pre-scan for HPC settings so positional FASTA compression below uses the
   // right cap regardless of argument order.
@@ -105,25 +110,41 @@ int run_index(int argc, char **argv) {
     }
     // positional FASTA input
     if (hpc_mode) {
-      char tmpl[] = "/tmp/svdss_hpc_XXXXXX.fa";
-      int fd = mkstemps(tmpl, 3);
-      if (fd < 0) {
-        spdlog::critical("mkstemps failed for HPC temp file");
-        return 1;
+      if (!hpc_tmp_created) {
+        // Honor $TMPDIR (fall back to /tmp) so the possibly-large concatenated
+        // temp can be placed on fast/roomy scratch instead of a small /tmp.
+        const char *tmpdir = getenv("TMPDIR");
+        if (tmpdir == nullptr || tmpdir[0] == '\0')
+          tmpdir = "/tmp";
+        string dir(tmpdir);
+        while (dir.size() > 1 && dir.back() == '/')
+          dir.pop_back();
+        string tmpl_s = dir + "/svdss_hpc_XXXXXX.fa";
+        vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+        tmpl.push_back('\0');
+        int fd = mkstemps(tmpl.data(), 3);
+        if (fd < 0) {
+          spdlog::critical("mkstemps failed for HPC temp file in {}", dir);
+          return 1;
+        }
+        close(fd);
+        hpc_tmp_path = tmpl.data();
+        hpc_tmp_created = true;
+        tmp_files.push_back(hpc_tmp_path);
+        // Hand ropebwt3 build this single temp exactly once so that all
+        // positional inputs count as one file (enables the fast pipeline).
+        char *dup = strdup(hpc_tmp_path.c_str());
+        owned_strings.push_back(dup);
+        new_argv.push_back(dup);
       }
-      close(fd);
-      string tmp_path(tmpl);
       try {
-        hpc_write_reference_fasta(string(argv[i]), tmp_path, hpc_cap);
+        hpc_write_reference_fasta(string(argv[i]), hpc_tmp_path, hpc_cap,
+                                  /*append=*/true);
       } catch (const std::exception &e) {
         spdlog::critical("HPC compression of {} failed: {}", argv[i], e.what());
-        unlink(tmp_path.c_str());
+        unlink(hpc_tmp_path.c_str());
         return 1;
       }
-      tmp_files.push_back(tmp_path);
-      char *dup = strdup(tmp_path.c_str());
-      owned_strings.push_back(dup);
-      new_argv.push_back(dup);
     } else {
       new_argv.push_back(argv[i]);
     }

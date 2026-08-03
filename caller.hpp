@@ -113,6 +113,12 @@ private:
   bool normal_read_concordant(bam1_t *aln, const string &chrom, const SV &sv,
                               int cl_s, int cl_e, int want, float min_ratio_len,
                               int diff_max, int diff_min_len);
+  // Count primary tumour reads spanning [s, s+len] with a single CIGAR D op
+  // reciprocally overlapping the interval (>= 0.5). These "through-reads" are
+  // minimap2's non-clipped representation of a < ~15 kbp deletion and are
+  // read-disjoint from the split (clipped) reads (Mode B clip rescue).
+  uint count_through_del_reads(samFile *bam, hts_idx_t *idx, bam_hdr_t *hdr,
+                               const string &chrom, uint s, uint len);
 
   // parallelize
   vector<vector<SV>> _p_svs;

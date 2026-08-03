@@ -49,8 +49,10 @@ int hpc_compress_nt6(const uint8_t *src, int len, uint8_t *dst,
 // `out_fa`, capping each run at `cap` copies (cap=1 = full collapse). Used by
 // the index step to feed ropebwt3 a compressed reference. Operates on plain
 // ASCII (A,C,G,T,N) preserving case-folded uppercase. The cap must match the
-// one used to compress reads at search time.
+// one used to compress reads at search time. When `append` is true the
+// compressed records are appended to `out_fa` instead of truncating it, so
+// multiple inputs can be concatenated into a single compressed FASTA.
 void hpc_write_reference_fasta(const string &in_fa, const string &out_fa,
-                               int cap = 1);
+                               int cap = 1, bool append = false);
 
 #endif

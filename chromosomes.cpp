@@ -70,7 +70,7 @@ int hpc_compress_nt6(const uint8_t *src, int len, uint8_t *dst,
 }
 
 void hpc_write_reference_fasta(const string &in_fa, const string &out_fa,
-                               int cap) {
+                               int cap, bool append) {
   if (cap < 1)
     cap = 1;
   spdlog::info("HPC-compressing reference {} -> {} (cap={})..", in_fa, out_fa,
@@ -79,7 +79,7 @@ void hpc_write_reference_fasta(const string &in_fa, const string &out_fa,
   if (fp == nullptr)
     throw runtime_error("Cannot open reference " + in_fa);
   kseq_t *seq = kseq_init(fp);
-  FILE *out = fopen(out_fa.c_str(), "w");
+  FILE *out = fopen(out_fa.c_str(), append ? "a" : "w");
   if (out == nullptr) {
     kseq_destroy(seq);
     gzclose(fp);

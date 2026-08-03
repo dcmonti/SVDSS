@@ -59,13 +59,47 @@ static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
                     c.sa_query_len, c.primary_reverse, c.sa_reverse, w, jc});
 }
 
-static bool sa_vote_winner(const vector<SAGroup> &groups, SAGroup &winner) {
+// Pick the SA group that dictates the cluster's coordinates. `clip_chrom`/
+// `clip_pos` are the cluster's own reference locus.
+//
+// A short event (< the 1000bp clustering radius) has both of its breakpoints
+// folded into a single clip cluster: the clips physically at breakpoint A carry
+// an SA pointing to B, and the clips at B point back to A. When the cluster is
+// keyed at B, the A-clips' SA lands on B itself, i.e. on the cluster's own
+// position, so their group predicts a zero-length event (junction == clip_pos).
+// That degenerate group can out-vote the partner group (the B-clips pointing at
+// A, which predict the real interval) by a single read and win, emitting
+// nothing -- a 279bp inversion whose vote splits 5(self)-vs-4(partner) is the
+// canonical case. A group whose junction sits within min_sv_length of the
+// cluster can never yield a call, so it must not beat one that predicts a real
+// interval. Fall back to the plain max-vote winner only when every group is
+// degenerate (the clip is then discarded downstream anyway). Cross-chromosome
+// (BND) groups are never degenerate: their junction is on another contig.
+static bool sa_vote_winner(const vector<SAGroup> &groups,
+                           const string &clip_chrom, uint clip_pos,
+                           SAGroup &winner) {
   if (groups.empty())
     return false;
-  uint best = 0;
-  for (uint i = 1; i < groups.size(); ++i) {
-    if (groups[i].count > groups[best].count)
-      best = i;
+  const uint min_len = Configuration::getInstance()->min_sv_length;
+  auto degenerate = [&](const SAGroup &g) {
+    if (g.sa_chrom != clip_chrom)
+      return false;
+    long long d = (long long)g.junction - (long long)clip_pos;
+    return (d < 0 ? -d : d) < (long long)min_len;
+  };
+  int best = -1;
+  for (uint i = 0; i < groups.size(); ++i) {
+    if (degenerate(groups[i]))
+      continue;
+    if (best < 0 || groups[i].count > groups[best].count)
+      best = (int)i;
+  }
+  if (best < 0) {
+    // every group is degenerate: keep the prior behaviour (plain max vote)
+    best = 0;
+    for (uint i = 1; i < groups.size(); ++i)
+      if (groups[i].count > groups[best].count)
+        best = (int)i;
   }
   winner = groups[best];
   return true;
@@ -134,6 +168,59 @@ static string strands_to_string(bool primary_reverse, bool sa_reverse) {
   s[2] = sa_reverse ? '-' : '+';
   return s;
 }
+
+// A clip that predicts a definite reference interval for its SV type. Used to
+// pool reciprocal INV/DEL evidence: an event's two breakpoints surface as two
+// (or more) independent clip clusters, each below min_cluster_weight, between
+// which minimap2 splits the junction reads. A read is primary on exactly one
+// side, so the clusters are read-disjoint and the group weight is a plain sum.
+struct IntervalCand {
+  string chrom;
+  uint s, e;    // predicted [start, end)
+  uint w;       // split-read support to contribute (sa_w)
+  bool is_left; // originating clip vector
+  uint idx;     // index into that vector
+};
+
+struct IntervalGroup {
+  string chrom;
+  uint s, e;
+  uint w;                           // summed support over the group
+  vector<pair<bool, uint>> members; // (is_left, idx)
+};
+
+static inline bool within(uint a, uint b, uint tol) {
+  return (uint)(a > b ? a - b : b - a) <= tol;
+}
+
+// Greedily group candidates whose predicted intervals coincide (both endpoints
+// within `tol`) and sum their weights. Real events are far wider than `tol`, so
+// an anchored sweep separates them cleanly. Grouping (vs a pairwise maximum)
+// means an event fragmented into 3+ clusters is summed, not under-counted.
+static vector<IntervalGroup> group_by_interval(const vector<IntervalCand> &cand,
+                                               uint tol) {
+  vector<IntervalGroup> groups;
+  vector<bool> used(cand.size(), false);
+  for (uint a = 0; a < cand.size(); a++) {
+    if (used[a])
+      continue;
+    IntervalGroup g{cand[a].chrom, cand[a].s, cand[a].e, cand[a].w,
+                    {{cand[a].is_left, cand[a].idx}}};
+    used[a] = true;
+    for (uint b = a + 1; b < cand.size(); b++) {
+      if (used[b] || cand[b].chrom != g.chrom)
+        continue;
+      if (!within(cand[a].s, cand[b].s, tol) ||
+          !within(cand[a].e, cand[b].e, tol))
+        continue;
+      used[b] = true;
+      g.w += cand[b].w;
+      g.members.push_back({cand[b].is_left, cand[b].idx});
+    }
+    groups.push_back(g);
+  }
+  return groups;
+}
 } // namespace
 
 Clipper::Clipper(const vector<Clip> &_clips) { clips = _clips; }
@@ -191,7 +278,7 @@ vector<Clip> Clipper::combine(const vector<Clip> &clips) {
       clip.names = names;
       clip.sa_names = sa_names;
       SAGroup winner;
-      if (sa_vote_winner(sa_votes, winner))
+      if (sa_vote_winner(sa_votes, chrom, it->first, winner))
         apply_sa_winner(clip, winner, sa_votes);
       _p_combined_clips[t].push_back(clip);
     }
@@ -259,7 +346,8 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
     for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
          it != clusters_by_pos.end(); ++it) {
       SAGroup winner;
-      if (sa_vote_winner(sa_votes_by_pos[it->first], winner))
+      if (sa_vote_winner(sa_votes_by_pos[it->first], kv.first, it->first,
+                         winner))
         apply_sa_winner(it->second, winner, sa_votes_by_pos[it->first]);
       clusters.push_back(it->second);
     }
@@ -563,29 +651,25 @@ void Clipper::call(int threads,
     }
   }
 
-  // Reciprocal INVERSION pooling. An inversion also has two junctions (one per
-  // breakpoint) and minimap2 splits the junction reads between them, so neither
-  // cluster alone may reach min_cluster_weight — the same failure the tandem-DUP
-  // pooling above fixes. Two differences make the DUP code inapplicable:
-  //   (1) strand: a DUP's split maps same-strand, an inversion's maps opposite;
-  //   (2) shape: the DUP clusters are a left/right pair, whereas the two INV
-  //       clusters are frequently SAME-side (both L or both R), so an lclips x
-  //       rclips loop never pairs them.
-  // Their SA targets also do not point at each other; instead each cluster
-  // independently predicts the SAME inversion interval (via the very formulas
-  // used to emit the SV below: sa_pos for a left clip, sa_pos+sa_ref_len for a
-  // right one). So pair by predicted interval and pool the split-read weights.
-  vector<uint> linv_pool(lclips.size(), 0);
-  vector<uint> rinv_pool(rclips.size(), 0);
+  // Reciprocal INVERSION + DELETION pooling. Both events have two breakpoints
+  // between which minimap2 splits the junction reads, so neither clip cluster
+  // may reach min_cluster_weight alone — the failure the tandem-DUP pooling
+  // above fixes for duplications. Each cluster independently predicts the SAME
+  // reference interval (via the emission formulas below), so we pair by
+  // predicted interval and pool the split-read weights. DUP is handled
+  // separately above: its clip coordinates are imprecise, so it matches
+  // breakends reciprocally instead of predicting a clean interval.
+  vector<uint> linv_pool(lclips.size(), 0), rinv_pool(rclips.size(), 0);
+  vector<uint> ldel_pool(lclips.size(), 0), rdel_pool(rclips.size(), 0);
   {
-    const uint INV_TOL = 100; // tolerance on the predicted interval endpoints
+    const uint min_sv_len = Configuration::getInstance()->min_sv_length;
 
-    // Predicted inversion interval of an INV-voting clip, mirroring the emission
-    // code: left clip -> target = sa_pos; right clip -> target = sa_pos+sa_ref_len.
+    // Predicted inversion interval (opposite strand): left clip -> sa_pos,
+    // right clip -> sa_pos + sa_ref_len (mirrors the emission code).
     auto inv_pred = [](const Clip &c, bool is_left, uint &s, uint &e) -> bool {
       if (!c.sa_has_info || c.sa_query_len == 0) return false;
       if (c.sa_chrom != c.chrom) return false;
-      if (c.primary_reverse == c.sa_reverse) return false; // INV = opposite strand
+      if (c.primary_reverse == c.sa_reverse) return false; // opposite strand
       uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
       uint target = is_left ? sa_pos0 : (sa_pos0 + c.sa_ref_len);
       s = min(c.p, target);
@@ -593,41 +677,76 @@ void Clipper::call(int threads,
       return e > s; // a degenerate (zero-length) prediction carries no interval
     };
 
-    // Flatten both sides into one list so L/L, R/R and L/R pairs are all covered.
-    struct InvCand {
-      string chrom;
-      uint s, e, w;
-      bool is_left;
-      uint idx;
+    // Predicted deletion interval (same strand, diff > 0). The start is the
+    // breakpoint each emission branch uses: sa_pos0 + sa_ref_len for a left
+    // clip, the primary end (== c.p, since diff > 0) for a right clip.
+    auto del_pred = [&](const Clip &c, bool is_left, uint &s, uint &e) -> bool {
+      if (!c.sa_has_info || c.sa_query_len == 0) return false;
+      if (c.sa_chrom != c.chrom) return false;
+      if (c.primary_reverse != c.sa_reverse) return false; // same strand
+      uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+      long long diff =
+          is_left ? (long long)c.p - (long long)(sa_pos0 + c.sa_ref_len)
+                  : (long long)sa_pos0 - (long long)c.p;
+      if (diff <= 0) return false; // DUP side (diff < 0) handled elsewhere
+      uint dR = (uint)diff;
+      uint sa_q = c.sa_query_start + c.sa_query_len;
+      uint dQ = (c.l > sa_q) ? (c.l - sa_q) : 0;
+      if (dR <= dQ + min_sv_len) return false; // INS side / too short for a DEL
+      uint start = is_left ? (sa_pos0 + c.sa_ref_len) : c.p;
+      s = start;
+      e = start + (dR - dQ);
+      return e > s;
     };
-    vector<InvCand> cand;
-    for (uint i = 0; i < lclips.size(); i++) {
-      uint s, e;
-      if (inv_pred(lclips[i], true, s, e))
-        cand.push_back({lclips[i].chrom, s, e, lclips[i].sa_w, true, i});
-    }
-    for (uint j = 0; j < rclips.size(); j++) {
-      uint s, e;
-      if (inv_pred(rclips[j], false, s, e))
-        cand.push_back({rclips[j].chrom, s, e, rclips[j].sa_w, false, j});
-    }
 
-    for (uint a = 0; a < cand.size(); a++) {
-      for (uint b = a + 1; b < cand.size(); b++) {
-        // Same predicted inversion: same chromosome, both endpoints within tolerance.
-        if (cand[a].chrom != cand[b].chrom)
-          continue;
-        if ((uint)abs((long long)cand[a].s - (long long)cand[b].s) > INV_TOL)
-          continue;
-        if ((uint)abs((long long)cand[a].e - (long long)cand[b].e) > INV_TOL)
-          continue;
-        uint pooled = cand[a].w + cand[b].w;
-        for (const InvCand *c : {&cand[a], &cand[b]}) {
-          uint &slot = c->is_left ? linv_pool[c->idx] : rinv_pool[c->idx];
-          if (pooled > slot)
-            slot = pooled;
-        }
+    // Flatten both clip sides into one candidate list so L/L, R/R and L/R pairs
+    // are all covered.
+    auto build = [&](auto pred) {
+      vector<IntervalCand> cand;
+      for (uint i = 0; i < lclips.size(); i++) {
+        uint s, e;
+        if (pred(lclips[i], true, s, e))
+          cand.push_back({lclips[i].chrom, s, e, lclips[i].sa_w, true, i});
       }
+      for (uint j = 0; j < rclips.size(); j++) {
+        uint s, e;
+        if (pred(rclips[j], false, s, e))
+          cand.push_back({rclips[j].chrom, s, e, rclips[j].sa_w, false, j});
+      }
+      return cand;
+    };
+    auto apply_pool = [&](const vector<IntervalGroup> &gs, vector<uint> &lp,
+                          vector<uint> &rp) {
+      for (const IntervalGroup &g : gs)
+        for (const auto &m : g.members) {
+          uint &slot = m.first ? lp[m.second] : rp[m.second];
+          if (g.w > slot) slot = g.w;
+        }
+    };
+
+    apply_pool(group_by_interval(build(inv_pred), 100), linv_pool, rinv_pool);
+
+    vector<IntervalGroup> del_groups = group_by_interval(build(del_pred), 500);
+    apply_pool(del_groups, ldel_pool, rdel_pool);
+
+    // Mode B candidates: a DEL group that stays below the gate on clips alone
+    // AND is short enough that minimap2 may also have emitted through-reads
+    // (< 15 kbp; it does not open D ops much beyond ~10 kbp). Caller adds the
+    // read-disjoint through-read count on the tumour BAM.
+    for (const IntervalGroup &g : del_groups) {
+      uint len = g.e - g.s;
+      if (g.w >= min_cw) continue;                    // already clears on clips
+      if (len < min_sv_len || len >= 15000) continue; // Mode B window
+      ClipDelCand pc;
+      pc.chrom = g.chrom;
+      pc.s = g.s;
+      pc.len = len;
+      pc.clip_w = g.w;
+      for (const auto &m : g.members) {
+        const Clip &c = m.first ? lclips[m.second] : rclips[m.second];
+        append_names(pc.names, c.names);
+      }
+      prov_dels.push_back(std::move(pc));
     }
   }
 
@@ -655,7 +774,8 @@ void Clipper::call(int threads,
        // split-read weight; linv_pool[i] does the same for an inversion whose
        // two junction clusters predict the same interval. Both are 0 when no
        // partner was found, so eff_w falls back to sa_total.
-       uint eff_w = max(lc.sa_total, max(lclip_pool[i], linv_pool[i]));
+       uint eff_w = max(lc.sa_total,
+                        max(lclip_pool[i], max(linv_pool[i], ldel_pool[i])));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -748,9 +868,13 @@ void Clipper::call(int threads,
                if (dR > dQ + min_sv_len) {
                    // DEL: reference gap exceeds query gap
                    uint l = dR - dQ;
-                   if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
+                   // Gate on the pooled weight: when the deletion's two junction
+                   // clusters each hold part of the split-read support, only the
+                   // pooled weight reflects the true evidence (see INV/DUP).
+                   uint del_w = max(lc.w, ldel_pool[i]);
+                   if (l >= min_sv_len && del_w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       SV sv = SV("DEL", chrom, j, refbase, "<DEL>", lc.w, 0, 0, 0, true, l);
+                       SV sv = SV("DEL", chrom, j, refbase, "<DEL>", del_w, 0, 0, 0, true, l);
                        sv.add_reads(lc.names);
                        sv.add_sa_reads(lc.sa_names);
                        _p_svs[t].push_back(sv);
@@ -823,7 +947,8 @@ void Clipper::call(int threads,
        // Weight gate on the breakend's split-read support (see left-clip loop):
        // rc.sa_total, i.e. the winning SA group plus its same-chrom same-strand
        // rivals, folded together with reciprocal DUP and INV pooling.
-       uint eff_w = max(rc.sa_total, max(rclip_pool[i], rinv_pool[i]));
+       uint eff_w = max(rc.sa_total,
+                        max(rclip_pool[i], max(rinv_pool[i], rdel_pool[i])));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -908,9 +1033,11 @@ void Clipper::call(int threads,
                if (dR > dQ + min_sv_len) {
                    // DEL: reference gap exceeds query gap
                    uint l = dR - dQ;
-                   if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
+                   // Gate on the pooled weight (see left-clip loop).
+                   uint del_w = max(rc.w, rdel_pool[i]);
+                   if (l >= min_sv_len && del_w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
-                       SV sv = SV("DEL", chrom, s, refbase, "<DEL>", rc.w, 0, 0, 0, true, l);
+                       SV sv = SV("DEL", chrom, s, refbase, "<DEL>", del_w, 0, 0, 0, true, l);
                        sv.add_reads(rc.names);
                        sv.add_sa_reads(rc.sa_names);
                        _p_svs[t].push_back(sv);
