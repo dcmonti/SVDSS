@@ -94,8 +94,20 @@ ostream &operator<<(ostream &os, const SV &sv) {
      << "COV2=" << sv.cov2 << ";"
      << "AS=" << sv.score << ";"
      << "NV=" << sv.ngaps << ";"
-     << "CIGAR=" << sv.cigar << ";"
-     << "RVEC=" << sv.rvec << ";"
+     << "CIGAR=" << sv.cigar << ";";
+  // Junction detail, Manta/DRAGEN style. Emitted only when present, so a flush
+  // junction produces exactly the record it did before these fields existed.
+  if (sv.ins_len > 0) {
+    os << "SVINSLEN=" << sv.ins_len << ";";
+    if (!sv.ins_seq.empty())
+      os << "SVINSSEQ=" << sv.ins_seq << ";";
+  }
+  if (sv.hom_len > 0) {
+    os << "HOMLEN=" << sv.hom_len << ";";
+    if (!sv.hom_seq.empty())
+      os << "HOMSEQ=" << sv.hom_seq << ";";
+  }
+  os << "RVEC=" << sv.rvec << ";"
     << "READS=" << sv.reads << ";"
     << "SA_READS=" << sv.sa_reads
      << (sv.imprecise ? ";IMPRECISE\t" : "\t")

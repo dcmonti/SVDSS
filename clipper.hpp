@@ -48,7 +48,26 @@ struct Clip {
   // sa_total gives the evidence and is what the weight gate must be compared
   // against. sa_w <= sa_total <= w.
   uint sa_total = 0;
-
+  // Inner unaligned query bases at the junction, for THIS read: the clip length
+  // minus the query span its own SA segment covers. Both operands must come
+  // from the same read — computing it from a cluster-level `l` (which is
+  // max(l) over every merged read) against one vote-winner's sa_query_* mixes
+  // provenance and yields a meaningless number.
+  //
+  // SIGNED on purpose, never clamped: dq > 0 means bases inserted between the
+  // two segments (reported as SVINSLEN/SVINSSEQ); dq < 0 means the segments
+  // overlap in query, i.e. breakpoint microhomology (reported as HOMLEN/HOMSEQ).
+  // The sign is the information.
+  int dq = 0;
+  // Every merged read's dq, pooled, so a cluster can report the median instead
+  // of one arbitrary member's value.
+  vector<int> dqs;
+  // The novel bases at the junction, populated only when dq > 0 (an insertion).
+  // Microhomology (dq < 0) needs no storage: those bases are identical to the
+  // reference at the breakpoint by definition, so HOMSEQ is read back off the
+  // reference at emission time. Keeping this empty for the common
+  // small-microhomology clip is what keeps the memory cost negligible.
+  string ins_seq;
 
   Clip() { w = 0; sa_has_info = false;}
 
@@ -73,6 +92,12 @@ struct Clip {
         sa_has_info(true), primary_reverse(primary_reverse_), sa_reverse(sa_reverse_),
         sa_chrom(sa_chrom_), sa_pos(sa_pos_), sa_ref_len(sa_ref_len_),
         sa_query_start(sa_query_start_), sa_query_len(sa_query_len_) {
+    // Same-strand fallback only: the raw SA CIGAR offsets are in the SA's own
+    // orientation, so this is wrong when the two segments differ in strand.
+    // Clusterer::extend_alignment overwrites dq/dqs via its set_junction
+    // helper, which normalises the SA span onto the primary's frame first.
+    dq = (int)l_ - (int)(sa_query_start_ + sa_query_len_);
+    dqs.push_back(dq);
     if (!name_.empty()) {
       names.push_back(name_);
       sa_names.push_back(name_);

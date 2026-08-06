@@ -29,6 +29,16 @@ public:
   string gt;
   int gtq;
   bool imprecise;
+  // Junction detail for split-read calls, following Manta/DRAGEN conventions.
+  // A deletion whose two segments are not flush carries either novel bases
+  // between them (ins_len/ins_seq -> SVINSLEN/SVINSSEQ) or an overlap where the
+  // shared bases align to both sides (hom_len/hom_seq -> HOMLEN/HOMSEQ). These
+  // are reported ALONGSIDE SVLEN/END, never netted out of them: SVLEN stays the
+  // number of deleted reference bases and END stays POS + that span.
+  int ins_len = 0;
+  int hom_len = 0;
+  string ins_seq;
+  string hom_seq;
   string cigar;
   string reads;
   string sa_reads;

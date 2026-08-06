@@ -1439,12 +1439,29 @@ void Caller::print_vcf_header() {
           "type\">"
        << endl;
   cout << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="
-          "\"Difference in "
-          "length between REF and ALT alleles\">"
+          "\"Number of inserted, duplicated, inverted or deleted bases "
+          "(negative for DEL), per VCF 4.4. For a deletion this is the "
+          "deleted reference span; any bases inserted at the junction are "
+          "reported separately in SVINSLEN/SVINSSEQ and are NOT netted out "
+          "of SVLEN or END\">"
        << endl;
   cout << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End "
           "position of "
           "the variant described in this record\">"
+       << endl;
+  cout << "##INFO=<ID=SVINSLEN,Number=1,Type=Integer,Description=\"Length "
+          "of insertion\">"
+       << endl;
+  cout << "##INFO=<ID=SVINSSEQ,Number=1,Type=String,Description=\"Sequence "
+          "of insertion. For clipped-read calls this is taken from the "
+          "supporting read whose insertion length matches SVINSLEN, not from "
+          "a consensus: the clipped path performs no assembly\">"
+       << endl;
+  cout << "##INFO=<ID=HOMLEN,Number=1,Type=Integer,Description=\"Length of "
+          "base pair identical homology at event breakpoints\">"
+       << endl;
+  cout << "##INFO=<ID=HOMSEQ,Number=1,Type=String,Description=\"Sequence of "
+          "base pair identical homology at event breakpoints\">"
        << endl;
   cout << "##INFO=<ID=WEIGHT,Number=1,Type=Integer,Description=\"Number "
           "of "

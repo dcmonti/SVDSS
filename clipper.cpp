@@ -19,7 +19,61 @@ struct SAGroup {
   bool sa_reverse;
   uint count;
   uint junction; // SA coordinate adjacent to the clip junction (vote key)
+  // Per-read dq of every clip that voted for this group. The group's
+  // coordinates come from the winner, so its junction length should too — and
+  // as a median over the voters, not one member's value.
+  vector<int> dqs;
+  // Candidate inserted sequences contributed by the voters (only clips with
+  // dq > 0 contribute). The representative is picked by matching length against
+  // the median dq, so the emitted SVINSSEQ belongs to a read that actually
+  // agrees with the reported SVINSLEN.
+  vector<string> ins_seqs;
 };
+
+// Median of a per-read statistic pooled over a cluster. Median rather than
+// mean or max: the distribution is tight (a real junction has every read
+// agreeing to within a few bp) but carries the occasional mismapped outlier.
+static int median_int(vector<int> v) {
+  if (v.empty())
+    return 0;
+  size_t mid = v.size() / 2;
+  nth_element(v.begin(), v.begin() + mid, v.end());
+  return v[mid];
+}
+
+// Attach Manta/DRAGEN-style junction detail to a split-read call. These are
+// reported ALONGSIDE SVLEN/END and are never netted out of them.
+//
+//   dq > 0 : novel bases sit between the two segments   -> SVINSLEN / SVINSSEQ
+//   dq < 0 : the segments overlap in query, i.e. the shared bases align to both
+//            sides                                      -> HOMLEN / HOMSEQ
+//   dq = 0 : flush junction, nothing emitted (record is byte-identical to what
+//            SVDSS produced before these fields existed)
+//
+// Homologous bases are by definition present in the reference at the junction,
+// so HOMSEQ is read straight back from it instead of being carried through
+// clustering — which is why Clip only ever stores inserted sequence.
+static void annotate_junction(SV &sv, int dq, const string &ins_seq,
+                              const char *ref_at_junction) {
+  // Real breakpoint microhomology is a handful of bases; a huge value means a
+  // pathological clip, not biology. There is no contig-length table in scope
+  // here, so capping the copy and stopping at the terminating '\0' is what
+  // keeps the read in bounds near the end of a contig.
+  constexpr int MAX_HOMSEQ = 1000;
+  if (dq > 0) {
+    sv.ins_len = dq;
+    sv.ins_seq = ins_seq;
+  } else if (dq < 0) {
+    sv.hom_len = -dq;
+    if (ref_at_junction != nullptr) {
+      int n = min(-dq, MAX_HOMSEQ);
+      int k = 0;
+      while (k < n && ref_at_junction[k] != '\0')
+        ++k;
+      sv.hom_seq.assign(ref_at_junction, (size_t)k);
+    }
+  }
+}
 
 // Coordinate on the SA (partner) segment that sits at the clip junction and is
 // therefore consistent across reads of the same event. For a same-strand split
@@ -47,16 +101,25 @@ static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
   // reads, so its size is the true breakend support.
   uint w = c.sa_names.size() > 0 ? (uint)c.sa_names.size() : 1;
   uint jc = sa_junction(c);
+  // Pool this clip's per-read dq values into whichever group it votes for.
+  const vector<int> &cdqs = c.dqs;
   for (SAGroup &g : groups) {
     if (g.sa_chrom == c.sa_chrom && g.primary_reverse == c.primary_reverse &&
         g.sa_reverse == c.sa_reverse &&
         (uint)abs((long long)g.junction - (long long)jc) <= SA_VOTE_POS_TOL) {
       g.count += w;
+      g.dqs.insert(g.dqs.end(), cdqs.begin(), cdqs.end());
+      if (!c.ins_seq.empty())
+        g.ins_seqs.push_back(c.ins_seq);
       return;
     }
   }
+  vector<string> iseqs;
+  if (!c.ins_seq.empty())
+    iseqs.push_back(c.ins_seq);
   groups.push_back({c.sa_chrom, c.sa_pos, c.sa_ref_len, c.sa_query_start,
-                    c.sa_query_len, c.primary_reverse, c.sa_reverse, w, jc});
+                    c.sa_query_len, c.primary_reverse, c.sa_reverse, w, jc,
+                    cdqs, iseqs});
 }
 
 // Pick the SA group that dictates the cluster's coordinates. `clip_chrom`/
@@ -115,6 +178,23 @@ static void apply_sa_winner(Clip &clip, const SAGroup &w,
   clip.sa_ref_len = w.sa_ref_len;
   clip.sa_query_start = w.sa_query_start;
   clip.sa_query_len = w.sa_query_len;
+  // dq comes from the winning group too, as the median over its voters — never
+  // recompute it from clip.l, which is max(l) over the whole cluster and so
+  // belongs to a different read than sa_query_*.
+  clip.dqs = w.dqs;
+  clip.dq = median_int(w.dqs);
+  // Representative inserted sequence: the one whose length matches the reported
+  // median, so SVINSSEQ and SVINSLEN describe the same read. Falls back to the
+  // first candidate if no voter matches exactly.
+  clip.ins_seq.clear();
+  if (clip.dq > 0 && !w.ins_seqs.empty()) {
+    clip.ins_seq = w.ins_seqs.front();
+    for (const string &s : w.ins_seqs)
+      if ((int)s.size() == clip.dq) {
+        clip.ins_seq = s;
+        break;
+      }
+  }
   clip.sa_w = w.count; // reads supporting the winning event
   // Rival groups describing the same breakend must count towards the weight
   // gate, even though the winner alone dictates the coordinates. Two groups
@@ -429,13 +509,17 @@ void Clipper::store_clip_clusters(const vector<Clip> &lclips,
         pred_len = std::to_string(-diff);
       } else {
         uint dR = (uint)diff;
-        uint sa_q = c.sa_query_start + c.sa_query_len;
-        uint dQ = (c.l > sa_q) ? (c.l - sa_q) : 0;
+        // Signed per-read median (see Clip::dq); clamp only for the routing
+        // gate so branch selection is unchanged.
+        int dq = c.dq;
+        uint dQ = dq > 0 ? (uint)dq : 0u;
         dR_s = std::to_string(dR);
-        dQ_s = std::to_string(dQ);
+        dQ_s = std::to_string(dq);
         if (dR > dQ + min_sv_len) {
           branch = "DEL";
-          pred_len = std::to_string(dR - dQ);
+          // Mirrors the emission branch: the DEL length is the deleted
+          // reference span (dR). dQ is reported in its own column.
+          pred_len = std::to_string(dR);
         } else if (dQ > dR + min_sv_len) {
           branch = "INS";
           pred_len = std::to_string(dQ - dR);
@@ -690,12 +774,15 @@ void Clipper::call(int threads,
                   : (long long)sa_pos0 - (long long)c.p;
       if (diff <= 0) return false; // DUP side (diff < 0) handled elsewhere
       uint dR = (uint)diff;
-      uint sa_q = c.sa_query_start + c.sa_query_len;
-      uint dQ = (c.l > sa_q) ? (c.l - sa_q) : 0;
+      uint dQ = c.dq > 0 ? (uint)c.dq : 0u; // clamped: routing gate only
       if (dR <= dQ + min_sv_len) return false; // INS side / too short for a DEL
       uint start = is_left ? (sa_pos0 + c.sa_ref_len) : c.p;
       s = start;
-      e = start + (dR - dQ);
+      // Must mirror the emission branches exactly: the interval spans the
+      // deleted reference (dR), not the net dR - dQ. A short end here shrinks
+      // the pooling window and can stop the two reciprocal breakpoints of one
+      // deletion from pooling at all.
+      e = start + dR;
       return e > s;
     };
 
@@ -861,13 +948,33 @@ void Clipper::call(int threads,
                string refbase(chromosome_seqs[chrom] + j, 1);
                // dR = reference gap between the two split alignments
                uint dR = (uint)diff;
-               // dQ = inner unaligned query bases = clip minus SA-covered query bases
-               uint sa_q = lc.sa_query_start + lc.sa_query_len;
-               uint dQ = (lc.l > sa_q) ? (lc.l - sa_q) : 0;
+               // dq = inner unaligned query bases at the junction, as the median
+               // over the reads that voted for this SA group (see Clip::dq).
+               // Signed: >0 inserted bases, <0 breakpoint microhomology.
+               int dq = lc.dq;
+               // Clamped copy for the routing gate: a microhomology junction
+               // (dq < 0) must not make the gate MORE permissive than a flush
+               // one, so negatives are treated as 0 exactly as before.
+               //
+               // Note this does NOT keep branch selection identical to the old
+               // code — it cannot. dq's *value* is now correct rather than
+               // mixed-provenance garbage, so events do move between the DEL,
+               // INS and NONE branches. That is the point: chr14:37,300,397
+               // was routed to INS by a bogus dQ=3038 and is a DEL(1625) once
+               // dq is computed honestly (1271).
+               uint dQ = dq > 0 ? (uint)dq : 0u;
 
                if (dR > dQ + min_sv_len) {
-                   // DEL: reference gap exceeds query gap
-                   uint l = dR - dQ;
+                   // DEL: reference gap exceeds query gap.
+                   // The length handed to SV() must be the DELETED REFERENCE SPAN
+                   // (dR), not the net allele-length change (dR - dQ). SV() derives
+                   // e = s + l, and j + dR == lc.p exactly — the observed distal
+                   // breakpoint — so netting dQ out here places END dQ bp short of
+                   // where the reads actually resume. Per VCF 4.4, SVLEN for a
+                   // symbolic <DEL> is the number of deleted reference bases; any
+                   // bases inserted at the junction are reported separately via
+                   // SVINSLEN/SVINSSEQ (see dQ handling below).
+                   uint l = dR;
                    // Gate on the pooled weight: when the deletion's two junction
                    // clusters each hold part of the split-read support, only the
                    // pooled weight reflects the true evidence (see INV/DUP).
@@ -875,6 +982,8 @@ void Clipper::call(int threads,
                    if (l >= min_sv_len && del_w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        SV sv = SV("DEL", chrom, j, refbase, "<DEL>", del_w, 0, 0, 0, true, l);
+                       annotate_junction(sv, dq, lc.ins_seq,
+                                         chromosome_seqs[chrom] + j);
                        sv.add_reads(lc.names);
                        sv.add_sa_reads(lc.sa_names);
                        _p_svs[t].push_back(sv);
@@ -1026,18 +1135,25 @@ void Clipper::call(int threads,
                // DEL or INS
                // dR = reference gap between the two split alignments
                uint dR = (uint)diff;
-               // dQ = inner unaligned query bases = clip minus SA-covered query bases
-               uint sa_q = rc.sa_query_start + rc.sa_query_len;
-               uint dQ = (rc.l > sa_q) ? (rc.l - sa_q) : 0;
+               // dq = per-read median inner unaligned query bases (see Clip::dq).
+               int dq = rc.dq;
+               // Clamped for the routing gate only; see the left-clip loop for
+               // why this does not preserve the old branch selection.
+               uint dQ = dq > 0 ? (uint)dq : 0u;
 
                if (dR > dQ + min_sv_len) {
-                   // DEL: reference gap exceeds query gap
-                   uint l = dR - dQ;
+                   // DEL: reference gap exceeds query gap. l is the DELETED
+                   // REFERENCE SPAN (dR), not the net dR - dQ — see the left-clip
+                   // loop for the full rationale. Here s + dR == sa_pos0 exactly,
+                   // the observed distal breakpoint.
+                   uint l = dR;
                    // Gate on the pooled weight (see left-clip loop).
                    uint del_w = max(rc.w, rdel_pool[i]);
                    if (l >= min_sv_len && del_w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        SV sv = SV("DEL", chrom, s, refbase, "<DEL>", del_w, 0, 0, 0, true, l);
+                       annotate_junction(sv, dq, rc.ins_seq,
+                                         chromosome_seqs[chrom] + s);
                        sv.add_reads(rc.names);
                        sv.add_sa_reads(rc.sa_names);
                        _p_svs[t].push_back(sv);

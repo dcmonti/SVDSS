@@ -499,6 +499,43 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     return {flipped_start, flipped_end};
   };
 
+  // Fill in this read's junction geometry: dq (inner unaligned query bases) and,
+  // when dq > 0, the inserted bases themselves.
+  //
+  // dq must be computed from query coordinates in the PRIMARY's frame, which is
+  // what sa_qspan_in_primary yields — the Clip constructor's fallback uses the
+  // raw SA CIGAR offsets and is therefore only valid for a same-strand split.
+  //
+  //   left  clip: the clip occupies primary-frame query [0, l);
+  //               the SA covers [span.first, span.second) -> dq = l - span.second
+  //   right clip: the clip occupies [primary_q_end, primary_q_end + l);
+  //               the SA starts at span.first          -> dq = span.first - primary_q_end
+  //
+  // Sign is meaningful and must survive: dq > 0 is novel sequence between the
+  // segments (SVINSLEN/SVINSSEQ), dq < 0 is breakpoint microhomology
+  // (HOMLEN/HOMSEQ, recoverable from the reference so no bases are stored here).
+  auto set_junction = [&](Clip &c, const SAEntry &sa, uint clip_len,
+                          bool is_left) {
+    auto span = sa_qspan_in_primary(sa);
+    long long dq = is_left ? (long long)clip_len - (long long)span.second
+                           : (long long)span.first - (long long)primary_q_end;
+    c.dq = (int)dq;
+    c.dqs.assign(1, c.dq);
+    if (dq <= 0)
+      return; // microhomology or blunt: nothing novel to store
+    // Novel bases, in primary-frame query coordinates. bam_get_seq is stored in
+    // the primary's orientation too, so the two frames agree.
+    long long qs = is_left ? (long long)span.second : (long long)primary_q_end;
+    if (qs < 0 || qs + dq > (long long)read_len)
+      return;
+    const uint8_t *seq = bam_get_seq(aln);
+    string ins;
+    ins.reserve((size_t)dq);
+    for (long long k = 0; k < dq; k++)
+      ins.push_back(seq_nt16_str[bam_seqi(seq, qs + k)]);
+    c.ins_seq = std::move(ins);
+  };
+
   // Pick the SA whose query span is most adjacent to the clip on the read.
   // For a left clip we match SA's end against primary's aligned start; for a
   // right clip we match SA's start against primary's aligned end. Tiebreakers
@@ -529,10 +566,11 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     int best = sa_entries.empty() ? -1 : pick_best_sa(primary_q_start, true);
     if (best >= 0) {
       const SAEntry &sa = sa_entries[best];
-      _p_clips[index].push_back(Clip(qname, chrom, lclip.first, lclip.second,
-                                     true, primary_reverse, sa.reverse,
-                                     sa.chrom, sa.pos, sa.ref_len,
-                                     sa.query_start, sa.query_len));
+      Clip c(qname, chrom, lclip.first, lclip.second, true, primary_reverse,
+             sa.reverse, sa.chrom, sa.pos, sa.ref_len, sa.query_start,
+             sa.query_len);
+      set_junction(c, sa, lclip.second, true);
+      _p_clips[index].push_back(std::move(c));
     } else {
       _p_clips[index].push_back(
           Clip(qname, chrom, lclip.first, lclip.second, true));
@@ -542,10 +580,11 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     int best = sa_entries.empty() ? -1 : pick_best_sa(primary_q_end, false);
     if (best >= 0) {
       const SAEntry &sa = sa_entries[best];
-      _p_clips[index].push_back(Clip(qname, chrom, rclip.first, rclip.second,
-                                     false, primary_reverse, sa.reverse,
-                                     sa.chrom, sa.pos, sa.ref_len,
-                                     sa.query_start, sa.query_len));
+      Clip c(qname, chrom, rclip.first, rclip.second, false, primary_reverse,
+             sa.reverse, sa.chrom, sa.pos, sa.ref_len, sa.query_start,
+             sa.query_len);
+      set_junction(c, sa, rclip.second, false);
+      _p_clips[index].push_back(std::move(c));
     } else {
       _p_clips[index].push_back(
           Clip(qname, chrom, rclip.first, rclip.second, false));
