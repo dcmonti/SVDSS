@@ -108,6 +108,10 @@ ostream &operator<<(ostream &os, const SV &sv) {
     if (!sv.ins_seq.empty())
       os << "SVINSSEQ=" << sv.ins_seq << ";";
   }
+  // Reference bases replaced by a clipped insertion. Additive: SVLEN and END
+  // keep the meaning they have always had, so no downstream comparison shifts.
+  if (sv.ref_gap > 0)
+    os << "REFGAP=" << sv.ref_gap << ";";
   if (sv.hom_len > 0) {
     os << "HOMLEN=" << sv.hom_len << ";";
     if (!sv.hom_seq.empty())

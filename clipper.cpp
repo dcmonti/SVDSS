@@ -1076,6 +1076,11 @@ void Clipper::call(int threads,
                    if (l >= min_sv_len && lc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        SV sv = SV("INS", chrom, j, refbase, "<INS>", lc.w, 0, 0, 0, true, l);
+                       // Reference bases the insertion replaces: j + dR is where the
+                       // SA segment resumes, i.e. the partner breakpoint. SVLEN nets
+                       // dR out, so without this the record cannot say where the
+                       // junction closes and the germline filter looks at POS.
+                       sv.ref_gap = (int)dR;
                        sv.add_reads(lc.names);
                        sv.add_sa_reads(lc.sa_names);
                        _p_svs[t].push_back(sv);
@@ -1250,6 +1255,8 @@ void Clipper::call(int threads,
                    if (l >= min_sv_len && rc.w >= Configuration::getInstance()->min_cluster_weight) {
                        sa_used = true;
                        SV sv = SV("INS", chrom, s, refbase, "<INS>", rc.w, 0, 0, 0, true, l);
+                       // See the left-clip branch: s + dR is the partner breakpoint.
+                       sv.ref_gap = (int)dR;
                        sv.add_reads(rc.names);
                        sv.add_sa_reads(rc.sa_names);
                        _p_svs[t].push_back(sv);

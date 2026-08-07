@@ -37,12 +37,24 @@ public:
   // number of deleted reference bases and END stays POS + that span.
   int ins_len = 0;
   int hom_len = 0;
+  // Reference bases replaced by the insertion (clipped path only). A clipped INS
+  // is a replacement event: dQ query bases stand in for dR reference bases, and
+  // SVLEN carries only the net dQ - dR. Without dR the partner breakpoint is not
+  // recoverable from the record, and the germline filter — which has to know
+  // where the mate segment resumes — would assume it sits at POS. 0 for a pure
+  // insertion (POA path, or a flush clipped junction).
+  int ref_gap = 0;
   string ins_seq;
   string hom_seq;
   string cigar;
   string reads;
   string sa_reads;
   string rvec;
+  // ID of the record holding the other breakend of this junction (BND only).
+  // Filled by Caller::link_bnd_mates() once every record exists; stays empty
+  // when only one side of the junction cleared the gates, which is the honest
+  // state — a dangling MATEID would claim a record that was never written.
+  string mate_id;
 
   SV();
   SV(const string type_, const string &chrom_, uint s_, const string &refall_,
@@ -50,11 +62,6 @@ public:
      const int score_, bool imprecise_ = false, uint l_ = 0,
      string cigar_ = ".");
   void add_reads(const vector<string> &reads_);
-  // ID of the record holding the other breakend of this junction (BND only).
-  // Filled by Caller::link_bnd_mates() once every record exists; stays empty
-  // when only one side of the junction cleared the gates, which is the honest
-  // state — a dangling MATEID would claim a record that was never written.
-  string mate_id;
     void add_sa_reads(const vector<string> &reads_);
 
   void set_cov(int, int, int, int);

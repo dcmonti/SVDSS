@@ -1084,7 +1084,13 @@ bool Caller::is_germline_breakend(const SV &sv, int t) {
     strand_req = 1;
   } else { // INS
     mate_chrom = sv.chrom;
-    mate_pos = sv.s;
+    // A clipped insertion is a replacement: the SA segment resumes ref_gap bases
+    // downstream, not at POS. Assuming adjacency made the filter blind to every
+    // germline replacement whose gap exceeds W — on COLO829 all four clipped INS
+    // false positives were germline events with 24-80 supporting split reads in
+    // the normal, each sitting 616-1340 bp outside the window. ref_gap is 0 for
+    // a pure insertion, so this is inert on the POA path.
+    mate_pos = (long)sv.s + sv.ref_gap;
     strand_req = 1;
   }
   if (mate_pos < 0)
@@ -1538,6 +1544,12 @@ void Caller::print_vcf_header() {
           "of insertion. For clipped-read calls this is taken from the "
           "supporting read whose insertion length matches SVINSLEN, not from "
           "a consensus: the clipped path performs no assembly\">"
+       << endl;
+  cout << "##INFO=<ID=REFGAP,Number=1,Type=Integer,Description=\"Reference "
+          "bases replaced by a clipped insertion. The two split alignments "
+          "resume REFGAP bases apart, so POS+REFGAP is the partner breakpoint; "
+          "SVLEN reports only the net inserted length (query gap minus REFGAP). "
+          "Absent for pure insertions\">"
        << endl;
   cout << "##INFO=<ID=HOMLEN,Number=1,Type=Integer,Description=\"Length of "
           "base pair identical homology at event breakpoints\">"
