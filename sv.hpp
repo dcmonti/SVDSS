@@ -50,6 +50,11 @@ public:
      const int score_, bool imprecise_ = false, uint l_ = 0,
      string cigar_ = ".");
   void add_reads(const vector<string> &reads_);
+  // ID of the record holding the other breakend of this junction (BND only).
+  // Filled by Caller::link_bnd_mates() once every record exists; stays empty
+  // when only one side of the junction cleared the gates, which is the honest
+  // state — a dangling MATEID would claim a record that was never written.
+  string mate_id;
     void add_sa_reads(const vector<string> &reads_);
 
   void set_cov(int, int, int, int);

@@ -226,6 +226,10 @@ void Caller::run() {
         }
       }
     }
+    // Two passes: first keep the records that survive every filter, then link
+    // the BND mates among the SURVIVORS, then print. Linking before filtering
+    // would let a MATEID name a record that is dropped a few lines later.
+    vector<SV> kept;
     for (size_t i = 0; i < clipped_svs.size(); i++) {
       const SV &sv = clipped_svs[i];
       if (suppressed[i]) continue;
@@ -239,9 +243,12 @@ void Caller::run() {
         // Serial loop → t=0.
         if (_p_normal_bam && is_germline_breakend(sv, 0))
           continue;
-        cout << sv << endl;
+        kept.push_back(sv);
       }
     }
+    link_bnd_mates(kept);
+    for (const SV &sv : kept)
+      cout << sv << endl;
   }
 
   if (_p_normal_bam) {
@@ -258,7 +265,82 @@ void Caller::run() {
   destroy_chromosomes();
 }
 
+// Pair up the two breakends of each translocation junction and cross-reference
+// them with MATEID. The link is rebuilt from the records themselves rather than
+// carried down from the clipper: the two breakends are emitted independently
+// (different clip clusters, different threads) and either one can still be
+// dropped by a downstream filter, so the only moment both IDs are known for
+// certain is here, with the final list in hand.
+//
+// Matching is by GEOMETRY, not by identifier: record A names B's locus in its
+// ALT and B names A's, so a junction is a pair that points at each other. The
+// two coordinates can disagree by a base or two — each side reads the boundary
+// off its own alignment — hence the tolerance.
+void Caller::link_bnd_mates(vector<SV> &records) {
+  const int MATE_TOL = 100;
+  // Breakend named by a BND ALT: ]chr:pos]T, [chr:pos[T, T[chr:pos[, T]chr:pos]
+  auto alt_target = [](const string &alt, string &chrom, int &pos) -> bool {
+    size_t b = alt.find_first_of("[]");
+    if (b == string::npos)
+      return false;
+    size_t e = alt.find_first_of("[]", b + 1);
+    if (e == string::npos || e <= b + 1)
+      return false;
+    const string inner = alt.substr(b + 1, e - b - 1);
+    const size_t colon = inner.rfind(':');
+    if (colon == string::npos || colon + 1 >= inner.size())
+      return false;
+    chrom = inner.substr(0, colon);
+    try {
+      pos = stoi(inner.substr(colon + 1));
+    } catch (const std::exception &) {
+      return false;
+    }
+    return true;
+  };
+
+  vector<size_t> bnds;
+  vector<string> tgt_chrom;
+  vector<int> tgt_pos;
+  for (size_t i = 0; i < records.size(); i++) {
+    if (records[i].type != "BND")
+      continue;
+    string c;
+    int p;
+    if (!alt_target(records[i].altall, c, p))
+      continue;
+    bnds.push_back(i);
+    tgt_chrom.push_back(c);
+    // The ALT carries a 1-based coordinate while SV::s is the 0-based clip
+    // position, the same convention the rest of the record uses.
+    tgt_pos.push_back(p > 0 ? p - 1 : 0);
+  }
+
+  size_t linked = 0;
+  for (size_t a = 0; a < bnds.size(); a++) {
+    SV &sa = records[bnds[a]];
+    if (!sa.mate_id.empty())
+      continue;
+    for (size_t b = a + 1; b < bnds.size(); b++) {
+      SV &sb = records[bnds[b]];
+      if (!sb.mate_id.empty())
+        continue;
+      if (tgt_chrom[a] != sb.chrom || tgt_chrom[b] != sa.chrom)
+        continue;
+      if (abs(tgt_pos[a] - sb.s) > MATE_TOL || abs(tgt_pos[b] - sa.s) > MATE_TOL)
+        continue;
+      sa.mate_id = sb.idx;
+      sb.mate_id = sa.idx;
+      linked++;
+      break;
+    }
+  }
+  spdlog::info("Linked {} BND mate pairs out of {} breakend records.", linked,
+               bnds.size());
+}
+
 void Caller::write_vcf() {
+  link_bnd_mates(svs);
   print_vcf_header();
   for (const SV &sv : svs) {
     if (excluded_by_bed_or_N(sv)) {
@@ -1504,6 +1586,9 @@ void Caller::print_vcf_header() {
          << endl;
   cout << "##INFO=<ID=RVEC,Number=.,Type=String,Description=\"Reads vector "
           "used by genotyper\">"
+       << endl;
+  cout << "##INFO=<ID=MATEID,Number=.,Type=String,Description=\"ID of the "
+          "record holding the other breakend of this BND junction\">"
        << endl;
   cout << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
        << endl;

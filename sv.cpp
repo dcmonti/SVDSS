@@ -95,6 +95,12 @@ ostream &operator<<(ostream &os, const SV &sv) {
      << "AS=" << sv.score << ";"
      << "NV=" << sv.ngaps << ";"
      << "CIGAR=" << sv.cigar << ";";
+  // BND breakends come in pairs; MATEID names the record holding the other end
+  // so a consumer can collapse the two into one event without re-deriving the
+  // junction from the ALT string. Emitted only when the mate was actually
+  // written out.
+  if (!sv.mate_id.empty())
+    os << "MATEID=" << sv.mate_id << ";";
   // Junction detail, Manta/DRAGEN style. Emitted only when present, so a flush
   // junction produces exactly the record it did before these fields existed.
   if (sv.ins_len > 0) {
