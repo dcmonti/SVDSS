@@ -764,6 +764,7 @@ void Clipper::call(int threads,
   // breakends reciprocally instead of predicting a clean interval.
   vector<uint> linv_pool(lclips.size(), 0), rinv_pool(rclips.size(), 0);
   vector<uint> ldel_pool(lclips.size(), 0), rdel_pool(rclips.size(), 0);
+  vector<uint> lbnd_pool(lclips.size(), 0), rbnd_pool(rclips.size(), 0);
   {
     const uint min_sv_len = Configuration::getInstance()->min_sv_length;
 
@@ -832,6 +833,62 @@ void Clipper::call(int threads,
 
     apply_pool(group_by_interval(build(inv_pred), 100), linv_pool, rinv_pool);
 
+    // Reciprocal BND pooling. A translocation junction surfaces as two clip
+    // clusters, one per breakend, and the reads crossing it are split between
+    // them by an accident of alignment: clip extraction skips supplementary
+    // alignments (clusterer.cpp), so each breakend only counts the reads whose
+    // PRIMARY segment landed on its side — minimap2 picks the longer segment,
+    // which has nothing to do with the strength of the evidence. A 13-read
+    // junction seen as 10+3 loses the 3-side (and with it the only breakend the
+    // truth set may be anchored on); seen as 7+6 it would lose both and the
+    // event disappears entirely. Pair the two breakends by their (chrom, pos)
+    // couple: each side already names the other, so the couple normalised by
+    // (chrom, pos) order is the same key from either side.
+    auto bnd_key = [](const Clip &c, bool is_left, string &key, uint &s,
+                      uint &e) -> bool {
+      if (!c.sa_has_info || c.sa_query_len == 0) return false;
+      const bool same_strand = (c.primary_reverse == c.sa_reverse);
+      const uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+      const uint min_bnd = Configuration::getInstance()->min_bnd_dist;
+      const uint dist = (c.p > sa_pos0) ? (c.p - sa_pos0) : (sa_pos0 - c.p);
+      // Mirrors the emission's as_bnd test exactly: pooling must not reach a
+      // clip that will be emitted as INV/DEL/DUP instead.
+      const bool as_bnd = (c.sa_chrom != c.chrom) ||
+                          (min_bnd > 0 && !same_strand && dist >= min_bnd);
+      if (!as_bnd) return false;
+      // Mate breakend, mirroring the two emission formulas (1-based -> 0-based).
+      const uint mate = is_left
+                            ? (same_strand ? c.sa_pos + c.sa_ref_len : c.sa_pos)
+                            : (same_strand ? c.sa_pos : c.sa_pos + c.sa_ref_len);
+      const uint mate0 = mate > 0 ? mate - 1 : 0;
+      if (c.chrom < c.sa_chrom || (c.chrom == c.sa_chrom && c.p <= mate0)) {
+        key = c.chrom + '\x1f' + c.sa_chrom;
+        s = c.p;
+        e = mate0;
+      } else {
+        key = c.sa_chrom + '\x1f' + c.chrom;
+        s = mate0;
+        e = c.p;
+      }
+      return true;
+    };
+    {
+      // Tight tolerance: reciprocal breakends of one junction agree to within a
+      // couple of bp (each is the other's SA boundary), and a loose window would
+      // merge distinct junctions that share a chromosome pair.
+      const uint BND_RECIP_TOL = 100;
+      vector<IntervalCand> cand;
+      string key;
+      uint s, e;
+      for (uint i = 0; i < lclips.size(); i++)
+        if (bnd_key(lclips[i], true, key, s, e))
+          cand.push_back({key, s, e, lclips[i].sa_w, true, i});
+      for (uint j = 0; j < rclips.size(); j++)
+        if (bnd_key(rclips[j], false, key, s, e))
+          cand.push_back({key, s, e, rclips[j].sa_w, false, j});
+      apply_pool(group_by_interval(cand, BND_RECIP_TOL), lbnd_pool, rbnd_pool);
+    }
+
     vector<IntervalGroup> del_groups = group_by_interval(build(del_pred), 500);
     apply_pool(del_groups, ldel_pool, rdel_pool);
 
@@ -881,7 +938,9 @@ void Clipper::call(int threads,
        // two junction clusters predict the same interval. Both are 0 when no
        // partner was found, so eff_w falls back to sa_total.
        uint eff_w = max(lc.sa_total,
-                        max(lclip_pool[i], max(linv_pool[i], ldel_pool[i])));
+                        max(lclip_pool[i],
+                            max(linv_pool[i],
+                                max(ldel_pool[i], lbnd_pool[i]))));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -902,7 +961,11 @@ void Clipper::call(int threads,
            // BND: cross-chrom or long-range intra-chrom translocation.
            // Consume clip regardless of weight.
            sa_used = true;
-           if (lc.w >= Configuration::getInstance()->min_cluster_weight) {
+           // Gate on the pooled weight, like DUP/INV/DEL: the raw clip weight
+           // is only the half of the junction's reads whose primary landed on
+           // this breakend (see the reciprocal BND pooling above).
+           uint bnd_w = max(lc.w, lbnd_pool[i]);
+           if (bnd_w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + lc.p, 1);
                // Mate junction position on the partner chromosome. For a left
                // clip the SA end adjacent to the junction is sa_pos+sa_ref_len
@@ -914,7 +977,7 @@ void Clipper::call(int threads,
                // strand), '[' takes it reverse-complemented (opposite strand).
                string br = same_strand ? "]" : "[";
                string alt = br + lc.sa_chrom + ":" + to_string(mate) + br + refbase;
-               SV sv = SV("BND", chrom, lc.p, refbase, alt, lc.w, 0, 0, 0, true, 0);
+               SV sv = SV("BND", chrom, lc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
                sv.add_reads(lc.names);
                sv.add_sa_reads(lc.sa_names);
                _p_svs[t].push_back(sv);
@@ -1076,7 +1139,9 @@ void Clipper::call(int threads,
        // rc.sa_total, i.e. the winning SA group plus its same-chrom same-strand
        // rivals, folded together with reciprocal DUP and INV pooling.
        uint eff_w = max(rc.sa_total,
-                        max(rclip_pool[i], max(rinv_pool[i], rdel_pool[i])));
+                        max(rclip_pool[i],
+                            max(rinv_pool[i],
+                                max(rdel_pool[i], rbnd_pool[i]))));
        if (eff_w < Configuration::getInstance()->min_cluster_weight)
          continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
@@ -1097,7 +1162,9 @@ void Clipper::call(int threads,
            // BND: cross-chrom or long-range intra-chrom translocation.
            // Consume clip regardless of weight.
            sa_used = true;
-           if (rc.w >= Configuration::getInstance()->min_cluster_weight) {
+           // Gate on the pooled weight (see the left-clip loop).
+           uint bnd_w = max(rc.w, rbnd_pool[i]);
+           if (bnd_w >= Configuration::getInstance()->min_cluster_weight) {
                string refbase(chromosome_seqs[chrom] + rc.p, 1);
                // Mate junction position: symmetrical to the left-clip case. For
                // a right clip the adjacent SA end is sa_pos when both map on the
@@ -1109,7 +1176,7 @@ void Clipper::call(int threads,
                // strand), ']' takes it reverse-complemented (opposite strand).
                string br = same_strand ? "[" : "]";
                string alt = refbase + br + rc.sa_chrom + ":" + to_string(mate) + br;
-               SV sv = SV("BND", chrom, rc.p, refbase, alt, rc.w, 0, 0, 0, true, 0);
+               SV sv = SV("BND", chrom, rc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
                sv.add_reads(rc.names);
                sv.add_sa_reads(rc.sa_names);
                _p_svs[t].push_back(sv);
