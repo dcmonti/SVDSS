@@ -80,12 +80,31 @@ static void annotate_junction(SV &sv, int dq, const string &ins_seq,
 // the left clip's junction is the SA segment END and the right clip's is the SA
 // START: a left clip's SA *start* scatters with the per-read clip length, which
 // would otherwise fragment the votes of a single tandem-DUP breakend into many
-// singleton groups. Opposite-strand / cross-chrom clips keep the SA start (the
-// mate anchor, which does not scatter this way).
+// singleton groups. Cross-chromosome clips keep the SA start (the mate anchor,
+// which does not scatter this way).
+//
+// An opposite-strand pair on the same chromosome is an inversion, and there the
+// scatter is MIRRORED: a right clip's SA *start* is the one that drifts with the
+// read's clip length, while its SA *end* is pinned to the partner junction. So
+// the rule flips — left clip -> SA start, right clip -> SA end — which is also
+// exactly the breakpoint the INV emission uses (min(p, sa_pos0) for a left clip,
+// sa_pos0 + sa_ref_len for a right one). Keeping the two in step matters twice
+// over: the vote groups stop fragmenting, and sa_vote_winner's degeneracy test
+// then measures the same point the emission will, so a group that would yield a
+// zero-length INV is recognised as degenerate instead of winning and emitting
+// nothing. An intra-chromosomal pair far enough apart to be classified BND is
+// excluded, because that branch emits the SA start as the mate anchor.
 static uint sa_junction(const Clip &c) {
-  if (c.sa_chrom == c.chrom && c.primary_reverse == c.sa_reverse)
+  if (c.sa_chrom != c.chrom)
+    return c.sa_pos;
+  if (c.primary_reverse == c.sa_reverse)
     return c.starting ? (c.sa_pos + c.sa_ref_len) : c.sa_pos;
-  return c.sa_pos;
+  const uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
+  const uint min_bnd = Configuration::getInstance()->min_bnd_dist;
+  const uint dist = (c.p > sa_pos0) ? (c.p - sa_pos0) : (sa_pos0 - c.p);
+  if (min_bnd > 0 && dist >= min_bnd)
+    return c.sa_pos;
+  return c.starting ? c.sa_pos : (c.sa_pos + c.sa_ref_len);
 }
 
 static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
