@@ -1294,12 +1294,25 @@ void Caller::pcall(const vector<Cluster> &clusters) {
       CIGAR cigar;
       cigar.parse_cigar(cigar_str.c_str());
       int nv = 0;
+      // Deletions are collected first and emitted after the walk, so that D ops
+      // split apart by a short aligned stretch can be joined back into one
+      // event (see config.merge_del). Everything here belongs to one consensus
+      // alignment, which is exactly the scope the merge must not exceed: two
+      // nearby calls backed by different reads are two events, not one.
+      struct DelOp {
+        uint rpos;
+        uint len;
+        uint kept_before; // M/=/X bases since the previous qualifying D op
+      };
+      vector<DelOp> del_ops;
+      uint kept_run = 0; // aligned bases seen since the last qualifying D op
       for (const auto &cigar_pair : cigar.ops) {
         uint l = cigar_pair.first;
         char op = cigar_pair.second;
         if (op == '=' || op == 'M') {
           rpos += l;
           cpos += l;
+          kept_run += l;
         } else if (op == 'I') {
           if (l >= config->min_sv_length) {
             SV sv = SV("INS", cl.chrom, rpos,
@@ -1314,16 +1327,47 @@ void Caller::pcall(const vector<Cluster> &clusters) {
           cpos += l;
         } else if (op == 'D') {
           if (l >= config->min_sv_length) {
-            SV sv = SV("DEL", cl.chrom, rpos,
-                       string(chromosome_seqs[chrom] + rpos - 1, l),
-                       string(chromosome_seqs[chrom] + rpos - 1, 1), allele_w,
-                       cl.cov, nv, score, false, l, cigar_str);
-            sv.add_reads(allele_names);
-            _svs.push_back(sv);
-            nv++;
+            del_ops.push_back({rpos, l, kept_run});
+            kept_run = 0;
           }
+          // A D op below min_sv_length deletes reference bases just like a big
+          // one: it must not count towards kept_run, or DELKEPT would claim the
+          // alignment kept bases it dropped.
           rpos += l;
         }
+      }
+      for (size_t d = 0; d < del_ops.size();) {
+        size_t last = d;
+        uint deleted = del_ops[d].len; // deleted bases in the group so far
+        uint kept = 0;
+        while (config->merge_del && last + 1 < del_ops.size()) {
+          const DelOp &nxt = del_ops[last + 1];
+          uint gap = nxt.rpos - (del_ops[last].rpos + del_ops[last].len);
+          if ((int)gap > config->merge_del_max_gap ||
+              gap > config->merge_del_max_gap_frac * deleted)
+            break;
+          deleted += nxt.len;
+          kept += nxt.kept_before;
+          ++last;
+        }
+        const uint start = del_ops[d].rpos;
+        const uint span = del_ops[last].rpos + del_ops[last].len - start;
+        SV sv = SV("DEL", cl.chrom, start,
+                   string(chromosome_seqs[chrom] + start - 1, span),
+                   string(chromosome_seqs[chrom] + start - 1, 1), allele_w,
+                   cl.cov, nv, score, false, span, cigar_str);
+        if (last > d) {
+          sv.del_parts = (int)(last - d + 1);
+          sv.del_kept = (int)kept;
+          spdlog::debug("[CALLER_MERGE_DEL] chrom={} start={} span={} parts={} "
+                        "kept={} w={}",
+                        cl.chrom, start, span, sv.del_parts, sv.del_kept,
+                        allele_w);
+        }
+        sv.add_reads(allele_names);
+        _svs.push_back(sv);
+        nv++;
+        d = last + 1;
       }
       if (_svs.empty()) {
 #pragma omp atomic
@@ -1556,6 +1600,15 @@ void Caller::print_vcf_header() {
        << endl;
   cout << "##INFO=<ID=HOMSEQ,Number=1,Type=String,Description=\"Sequence of "
           "base pair identical homology at event breakpoints\">"
+       << endl;
+  cout << "##INFO=<ID=DELPARTS,Number=1,Type=Integer,Description=\"Number of "
+          "D operations of the same consensus alignment merged into this "
+          "deletion. Absent when the record came from a single D operation\">"
+       << endl;
+  cout << "##INFO=<ID=DELKEPT,Number=1,Type=Integer,Description=\"Reference "
+          "bases between the merged D operations that the alignment does not "
+          "delete. SVLEN and END span the whole POS..END interval, so DELKEPT "
+          "of them are retained; CIGAR holds the exact structure\">"
        << endl;
   cout << "##INFO=<ID=WEIGHT,Number=1,Type=Integer,Description=\"Number "
           "of "

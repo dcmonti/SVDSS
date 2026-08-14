@@ -117,6 +117,10 @@ ostream &operator<<(ostream &os, const SV &sv) {
     if (!sv.hom_seq.empty())
       os << "HOMSEQ=" << sv.hom_seq << ";";
   }
+  // Emitted only for records the D-op merge actually joined, so a deletion that
+  // came out of a single D operation prints exactly what it printed before.
+  if (sv.del_parts > 1)
+    os << "DELPARTS=" << sv.del_parts << ";DELKEPT=" << sv.del_kept << ";";
   os << "RVEC=" << sv.rvec << ";"
     << "READS=" << sv.reads << ";"
     << "SA_READS=" << sv.sa_reads

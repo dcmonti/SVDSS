@@ -27,7 +27,14 @@ public:
   int ngaps;
   int score;
   string gt;
-  int gtq;
+  // Only set_gt() ever writes gtq, and only the POA path calls it. The clipped
+  // path builds its records straight from the constructor, so without a default
+  // here every clipped call printed whatever happened to be on the stack: on
+  // HG008 that read 0 for 108 of 116 clipped records and garbage (1,
+  // -2010473030, 1886501328) for the rest, which also made two runs of the same
+  // binary disagree. 0 is the honest value for a path that computes no
+  // genotype quality, and matches the neutral gt/rvec the constructor sets.
+  int gtq = 0;
   bool imprecise;
   // Junction detail for split-read calls, following Manta/DRAGEN conventions.
   // A deletion whose two segments are not flush carries either novel bases
@@ -44,6 +51,15 @@ public:
   // where the mate segment resumes — would assume it sits at POS. 0 for a pure
   // insertion (POA path, or a flush clipped junction).
   int ref_gap = 0;
+  // Deletions that the consensus alignment split into several D operations and
+  // the caller put back together. del_parts counts them (0 or 1 = untouched
+  // record), del_kept is how many reference bases between them the alignment
+  // does NOT delete. Additive, like the fields above: SVLEN stays the full
+  // POS..END span, so nothing downstream has to learn about the split, and
+  // del_kept says how much of that span the alignment actually kept. The exact
+  // structure remains readable in CIGAR.
+  int del_parts = 0;
+  int del_kept = 0;
   string ins_seq;
   string hom_seq;
   string cigar;

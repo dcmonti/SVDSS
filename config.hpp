@@ -65,6 +65,9 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --poa-min-freq <FLOAT>           min allele fraction for --diploid-poa to split a cluster (default: 0.20)\n"
   "      --germline-realign               re-align normal reads with the tumor's ksw2 for the germline test (experimental)\n"
   "      --germline-realign-margin <INT>  flank added to the SV window when re-aligning normal reads (default: 300)\n"
+  "      --no-merge-del                   do not merge D operations of the same alignment split by a short aligned stretch\n"
+  "      --merge-del-gap <INT>            maximum gap between merged D operations, in bp (default: 100)\n"
+  "      --merge-del-gap-frac <FLOAT>     maximum gap as a fraction of the deleted bases so far (default: 0.20)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -166,6 +169,18 @@ public:
   // interval. Applies to the SFS/POA path only — clipped-path SVs carry no SFS
   // and are never touched. On by default; --no-require-sfs-overlap disables.
   bool require_sfs_overlap = true;
+  // Merge D operations of the SAME consensus alignment that a short aligned
+  // stretch splits apart. ksw2 fragments a deletion where minimap2 keeps it
+  // whole (the same effect germline_realign compensates for on the normal side),
+  // so one event leaves the caller as two records that each miss the truth on
+  // size. Scoped to the POA path and to DEL: clipped-path calls carry no CIGAR
+  // and never enter, and for INS the length lives in the sequence rather than in
+  // the reference span, so a gap-based rule there is meaningless.
+  // Both gates must hold, the relative one keeping small neighbouring deletions
+  // apart: two 60 bp DELs 100 bp away fail it (100 > 0.2 * 120).
+  bool merge_del = true;
+  int merge_del_max_gap = 100;
+  float merge_del_max_gap_frac = 0.2;
   int max_cluster_dist = 0; // 0 means auto-computed
 
   string bam = "";
