@@ -63,6 +63,11 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --no-germline-diff               disable the difference-based germline test (ratio-only)\n"
   "      --diploid-poa                    emit up to two POA consensuses per cluster (one per allele; experimental)\n"
   "      --poa-min-freq <FLOAT>           min allele fraction for --diploid-poa to split a cluster (default: 0.20)\n"
+  "      --no-gates                       disable the post-call GERMLINE/LOWPOWER gates\n"
+  "      --gate-min-reads <INT>           normal reads matching ALEN needed to drop a call as germline (default: 2)\n"
+  "      --gate-tol-frac <FLOAT>          relative tolerance of the ALEN match (default: 0.25)\n"
+  "      --gate-q <FLOAT>                 P(a normal read of the event's haplotype shows a het) (default: 0.85)\n"
+  "      --gate-conf <FLOAT>              below this confidence a call is flagged LOWPOWER (default: 0.95)\n"
   "      --germline-realign               re-align normal reads with the tumor's ksw2 for the germline test (experimental)\n"
   "      --germline-realign-margin <INT>  flank added to the SV window when re-aligning normal reads (default: 300)\n"
   "      --no-merge-del                   do not merge D operations of the same alignment split by a short aligned stretch\n"
@@ -158,6 +163,22 @@ public:
   // Additive: it can only mark MORE reads concordant, so it can only remove
   // calls. Skipped for SVs longer than germline_realign_max_len (window too
   // large to realign cheaply).
+  // Post-call gates, evaluated once on the records that are about to be written
+  // (see Caller::apply_gates). They do NOT replace the germline filter that runs
+  // during calling: that one removes 1246 of 1419 candidates on HG008, using
+  // min_reads=1 and the ksw2 realign. These act on what survives it, and the one
+  // thing they add is the comparison against ALEN -- the length the supporting
+  // reads carry -- which the in-call filter cannot make because all it has is
+  // SVLEN, and on some VNTRs the two differ (a DEL reported at 77 bp whose reads
+  // all carry 467).
+  //   GERMLINE: >= gate_min_reads normal reads carry the same allele -> dropped.
+  //   LOWPOWER: too little normal depth ON THE EVENT'S HAPLOTYPE for "absent
+  //             from the normal" to mean anything -> kept, FILTER=LOWPOWER.
+  bool gates = true;
+  int gate_min_reads = 2;
+  float gate_tol_frac = 0.25;
+  float gate_q = 0.85;   // P(a normal read of the right haplotype shows a het)
+  float gate_conf = 0.95;
   bool germline_realign = true;
   int germline_realign_margin = 300; // (unused: window is now the cluster interval)
   int germline_realign_max_len = 15000; // skip realign when cl_e-cl_s exceeds this

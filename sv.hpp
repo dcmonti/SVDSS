@@ -9,6 +9,48 @@
 
 using namespace std;
 
+// Per-record evidence for telling a somatic call from a germline one, emitted
+// as INFO so the decision can be prototyped on the VCF before any of it becomes
+// a filter. Nothing here changes which records are written.
+//
+// Two independent axes, deliberately kept apart:
+//
+//   1. Is the normal carrying this event?  n_conc/n_lens say what the normal
+//      actually holds. is_germline() answers only yes/no against sv.l, so a
+//      record whose reported length differs from the allele the reads carry
+//      escapes with no trace of why; n_lens keeps the raw lengths so the test
+//      can be re-run against any length downstream.
+//
+//   2. Could we even have seen it?  A germline het sits on ONE haplotype, so
+//      the power to exclude it is set by the normal depth on THAT haplotype,
+//      not by the total. nhp1/nhp2 vs hp1/hp2 make that computable: on HG008,
+//      three calls had 5-6 normal reads all from the haplotype opposite the
+//      event, where total depth alone looked like adequate evidence of absence.
+//
+// -1 means "not evaluated" (no normal BAM given) and must not be read as zero.
+// n_lens/n_conc stay empty for BND/DUP/INV, which carry no indel to compare;
+// the haplotype counts are filled for every type.
+struct CallStats {
+  // Tumour side: haplotypes of the reads supporting THIS record, and the indel
+  // length those reads actually carry. A record built from reads of both
+  // haplotypes is not a single-copy event; a wide alen_min-alen_max means the
+  // consensus is averaging reads that do not agree on a length.
+  //
+  // alen is measured the same way NLENS is measured on the normal, so the two
+  // are directly comparable -- which SVLEN and NLENS are not, because SVLEN
+  // comes out of the consensus alignment and can differ from every read that
+  // built it (HG008: a DEL reported at 77 bp whose reads all carry 467).
+  int hp1 = 0, hp2 = 0, hp0 = 0;
+  int alen_med = 0, alen_min = 0, alen_max = 0;
+  int n_sup = 0; // supporting reads actually found in the tumour BAM
+  // Normal side, filled by Caller::collect_call_stats().
+  int n_exam = -1;    // reads passing flag/MAPQ and spanning the breakpoint
+  int n_lowq = -1;    // reads dropped for MAPQ alone (min_mapq is strict)
+  int n_conc = -1;    // reads carrying a concordant indel (germline support)
+  int nhp1 = -1, nhp2 = -1, nhp0 = -1; // spanning normal reads per haplotype
+  vector<int> n_lens; // same-type indel lengths seen in the normal window
+};
+
 class SV {
 public:
   string type;
@@ -71,6 +113,11 @@ public:
   // when only one side of the junction cleared the gates, which is the honest
   // state — a dangling MATEID would claim a record that was never written.
   string mate_id;
+  CallStats stats;
+  // VCF FILTER. "PASS" unless a post-call gate demoted it: a flagged record is
+  // still written, so the full file stays the ALL callset and `bcftools view -f
+  // PASS` is the confident subset.
+  string filter = "PASS";
 
   SV();
   SV(const string type_, const string &chrom_, uint s_, const string &refall_,

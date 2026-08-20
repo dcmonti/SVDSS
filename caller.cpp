@@ -117,6 +117,8 @@ void Caller::run() {
   filter_sv_chains();
   spdlog::info("Writing {} SVs.", svs.size());
   sort(svs.begin(), svs.end());
+  collect_call_stats(svs);
+  apply_gates(svs);
   write_vcf();
 
   if (config->poa.compare("") != 0) {
@@ -246,6 +248,8 @@ void Caller::run() {
         kept.push_back(sv);
       }
     }
+    collect_call_stats(kept);
+    apply_gates(kept);
     link_bnd_mates(kept);
     for (const SV &sv : kept)
       cout << sv << endl;
@@ -971,6 +975,256 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
   return germline;
 }
 
+// Descriptive evidence for the records that will actually be written (see
+// CallStats in sv.hpp). Nothing here decides anything.
+//
+// Why a separate pass instead of collecting inside is_germline(): that function
+// is a decision, and it is cheap because it stops at the first concordant
+// normal read. Gathering full counts there meant scanning the whole locus for
+// every candidate cluster and cost 2.1x runtime. Here the scan runs once per
+// EMITTED record -- 201 on HG008 instead of ~1.6M clusters -- and it also
+// reaches the clipped path, which never goes through is_germline() at all and
+// accounts for every BND/DUP/INV plus the Mode-B deletions.
+void Caller::collect_call_stats(vector<SV> &recs) {
+  if (recs.empty())
+    return;
+  samFile *tbam = nullptr;
+  hts_idx_t *tidx = nullptr;
+  bam_hdr_t *thdr = nullptr;
+  if (!config->bam.empty()) {
+    tbam = hts_open(config->bam.c_str(), "r");
+    tidx = tbam ? sam_index_load(tbam, config->bam.c_str()) : nullptr;
+    thdr = tbam ? sam_hdr_read(tbam) : nullptr;
+  }
+  if (!tbam || !tidx || !thdr)
+    spdlog::warn("[CALL_STATS] tumour BAM unavailable; HP*/ALEN* left at 0");
+
+  bam1_t *aln = bam_init1();
+  const int win = 150; // same window the germline test uses
+
+  for (SV &sv : recs) {
+    const int want = (sv.type == "INS")   ? BAM_CINS
+                     : (sv.type == "DEL") ? BAM_CDEL
+                                          : -1;
+    const int sv_len = abs(sv.l);
+    const string region = sv.chrom + ":" + to_string(max(0, sv.s - win)) + "-" +
+                          to_string(sv.s + sv_len + win);
+
+    // ---- tumour: haplotype and carried length of the supporting reads ----
+    // The read set is the one named in the record, so anyone can re-derive
+    // these from the VCF plus the BAM.
+    if (tbam && tidx && thdr) {
+      unordered_set<string> want_names;
+      for (const string *src : {&sv.reads, &sv.sa_reads}) {
+        size_t b = 0;
+        while (b < src->size()) {
+          size_t e = src->find(',', b);
+          if (e == string::npos)
+            e = src->size();
+          if (e > b)
+            want_names.insert(src->substr(b, e - b));
+          b = e + 1;
+        }
+      }
+      if (!want_names.empty()) {
+        hts_itr_t *it = sam_itr_querys(tidx, thdr, region.c_str());
+        if (it) {
+          unordered_set<string> seen; // a read can have several alignments here
+          vector<int> lens;
+          while (sam_itr_next(tbam, it, aln) > 0) {
+            if (aln->core.flag & (BAM_FSECONDARY | BAM_FUNMAP))
+              continue;
+            string qn = bam_get_qname(aln);
+            if (!want_names.count(qn) || !seen.insert(qn).second)
+              continue;
+            uint8_t *hp_aux = bam_aux_get(aln, "HP");
+            int hp = hp_aux ? bam_aux2i(hp_aux) : 0;
+            ++(hp == 1 ? sv.stats.hp1 : hp == 2 ? sv.stats.hp2 : sv.stats.hp0);
+            if (want == -1)
+              continue; // BND/DUP/INV carry no indel to measure
+            int best = 0;
+            uint rpos = aln->core.pos;
+            for (const auto &op : decode_cigar(aln)) {
+              const int bam_op = op.second;
+              const int l = (int)op.first;
+              if (bam_op == want && (int)rpos >= sv.s - win &&
+                  (int)rpos <= sv.s + sv_len + win && l > best)
+                best = l;
+              if (bam_op == BAM_CMATCH || bam_op == BAM_CEQUAL ||
+                  bam_op == BAM_CDIFF || bam_op == BAM_CDEL ||
+                  bam_op == BAM_CREF_SKIP)
+                rpos += l;
+            }
+            if (best > 0)
+              lens.push_back(best);
+          }
+          sv.stats.n_sup = (int)seen.size();
+          if (!lens.empty()) {
+            sort(lens.begin(), lens.end());
+            sv.stats.alen_min = lens.front();
+            sv.stats.alen_max = lens.back();
+            sv.stats.alen_med = lens[lens.size() / 2];
+          }
+          hts_itr_destroy(it);
+        }
+      }
+    }
+
+    // ---- normal: how much of each haplotype we sampled, and what it holds ----
+    if (!_p_normal_bam)
+      continue;
+    hts_itr_t *it = sam_itr_querys(_p_normal_idx[0], _p_normal_hdr[0],
+                                   region.c_str());
+    if (!it)
+      continue;
+    int spanning = 0, lowq = 0, conc = 0, nhp[3] = {0, 0, 0};
+    vector<int> seen_lens;
+    while (sam_itr_next(_p_normal_bam[0], it, aln) > 0) {
+      if (aln->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP))
+        continue;
+      if ((int)aln->core.qual < (int)config->min_mapq) {
+        ++lowq; // counted, not silently dropped: min_mapq is 60 on the HG008
+                // run and in repeats it can hide the germline evidence itself
+        continue;
+      }
+      if (aln->core.pos > sv.s || (int)(bam_endpos(aln) - 1) < sv.s)
+        continue; // must span the breakpoint to carry the event
+      ++spanning;
+      // Counted for every spanning read, not just the concordant ones: what
+      // this answers is how much of each haplotype we sampled, which is what
+      // decides whether "absent from the normal" means anything.
+      uint8_t *hp_aux = bam_aux_get(aln, "HP");
+      int hp = hp_aux ? bam_aux2i(hp_aux) : 0;
+      ++nhp[(hp == 1 || hp == 2) ? hp : 0];
+      if (want == -1)
+        continue;
+      bool hit = false;
+      uint rpos = aln->core.pos;
+      for (const auto &op : decode_cigar(aln)) {
+        const int bam_op = op.second;
+        const int l = (int)op.first;
+        if (bam_op == want && (int)rpos >= sv.s - win &&
+            (int)rpos <= sv.s + sv_len + win &&
+            l >= (int)config->min_sv_length) {
+          // The length is kept whatever it is. is_germline() only reports
+          // whether SOME normal indel matched sv.l, so a locus where the normal
+          // plainly carries the event at a different length is indistinguishable
+          // from an empty one. These lengths make that case visible and let the
+          // test be re-run against ALEN instead of SVLEN.
+          if (seen_lens.size() < 32)
+            seen_lens.push_back(l);
+          hit = true;
+        }
+        if (bam_op == BAM_CMATCH || bam_op == BAM_CEQUAL ||
+            bam_op == BAM_CDIFF || bam_op == BAM_CDEL ||
+            bam_op == BAM_CREF_SKIP)
+          rpos += l;
+      }
+      if (hit)
+        ++conc;
+    }
+    hts_itr_destroy(it);
+    sv.stats.n_exam = spanning;
+    sv.stats.n_lowq = lowq;
+    sv.stats.n_conc = conc;
+    sv.stats.nhp0 = nhp[0];
+    sv.stats.nhp1 = nhp[1];
+    sv.stats.nhp2 = nhp[2];
+    sv.stats.n_lens = seen_lens;
+  }
+
+  bam_destroy1(aln);
+  if (thdr)
+    bam_hdr_destroy(thdr);
+  if (tidx)
+    hts_idx_destroy(tidx);
+  if (tbam)
+    hts_close(tbam);
+}
+
+// The two post-call gates. Kept apart from collect_call_stats() on purpose:
+// that one only describes, this one only decides, so the INFO fields stay
+// meaningful even with --no-gates and the thresholds can be re-tuned on the VCF
+// without rebuilding.
+//
+// GATE A -- GERMLINE. The normal carries the same allele, so the call is not
+// somatic. Tested against ALEN (what the supporting reads carry) and only
+// against SVLEN when no ALEN exists, because the two disagree exactly where the
+// in-call germline filter fails: a VNTR deletion reported at 77 bp whose reads
+// and whose normal both carry 467. Records that fail it are FLAGGED, not
+// dropped: the threshold is calibrated on 32 false positives from one sample,
+// so the call stays in the file where it can be audited, and `bcftools view -f
+// PASS` gives the same set a hard drop would have produced.
+//
+// GATE B -- LOWPOWER. A germline het sits on ONE haplotype, so the power to
+// exclude it is set by the normal depth on THAT haplotype. Zero reads from the
+// event's haplotype means "absent from the normal" carries no information, no
+// matter how deep the locus looks in total: on HG008 one call had 8 normal
+// reads (98.3% confidence by total depth) of which zero came from the haplotype
+// the event sits on (0% confidence). These records are NOT dropped -- the
+// evidence is missing, not contrary -- they are flagged so that PASS keeps its
+// meaning and the record survives in the full callset.
+//
+// B is evaluated only where A found nothing: power qualifies silence, and there
+// is no silence to qualify once the normal has spoken.
+void Caller::apply_gates(vector<SV> &recs) {
+  if (!config->gates)
+    return;
+  size_t n_germ = 0, n_low = 0;
+  for (SV &sv : recs) {
+    // ---- gate A ----
+    const int L = sv.stats.alen_med > 0 ? sv.stats.alen_med : abs(sv.l);
+    int matching = 0;
+    if (L > 0) {
+      const double tol = max((double)config->min_sv_length,
+                             (double)config->gate_tol_frac * L);
+      for (int x : sv.stats.n_lens)
+        if (abs(x - L) <= tol)
+          ++matching;
+    }
+    if (matching >= config->gate_min_reads) {
+      sv.filter = "GERMLINE";
+      ++n_germ;
+      spdlog::debug("[GATE_A][GERMLINE] {} len_used={} matching_normal={} "
+                    "nlens={}",
+                    sv.idx, L, matching, sv.stats.n_lens.size());
+      continue; // the normal has spoken; gate B only qualifies silence
+    }
+    // ---- gate B ----
+    // Unphased normal reads do come from one of the two haplotypes: split them
+    // in proportion, but with a Beta(1,1) pseudocount. Raw proportions turn a
+    // 2-vs-0 count into "the other haplotype has zero depth", and 2 vs 0 is
+    // noise, not skew.
+    const int a = max(0, sv.stats.nhp1), b = max(0, sv.stats.nhp2),
+              u = max(0, sv.stats.nhp0);
+    const double d1 = a + u * (double)(a + 1) / (a + b + 2);
+    const double d2 = b + u * (double)(b + 1) / (a + b + 2);
+    const double miss1 = pow(1.0 - config->gate_q, d1);
+    const double miss2 = pow(1.0 - config->gate_q, d2);
+    // Which haplotype the event sits on, from its own supporting reads. Reads
+    // on both (a homozygous variant, or a repeat where the tagging blends) name
+    // no single haplotype, and neither does an untagged record: in both cases
+    // average the two, which is the conservative reading.
+    const int h1 = sv.stats.hp1, h2 = sv.stats.hp2;
+    const int lo = min(h1, h2);
+    double p_miss;
+    if (h1 + h2 == 0 || (lo >= 2 && (double)lo / (h1 + h2) >= 0.25))
+      p_miss = 0.5 * miss1 + 0.5 * miss2;
+    else
+      p_miss = (h1 > h2) ? miss1 : miss2;
+    if (1.0 - p_miss < config->gate_conf) {
+      sv.filter = "LOWPOWER";
+      ++n_low;
+      spdlog::debug("[GATE_B][LOWPOWER] {} hp={}/{} normal_hp={}/{}/{} "
+                    "conf={:.4f}",
+                    sv.idx, h1, h2, a, b, u, 1.0 - p_miss);
+    }
+  }
+  spdlog::info("[GATES] {} flagged GERMLINE (gate A), {} flagged LOWPOWER "
+               "(gate B), {} PASS",
+               n_germ, n_low, recs.size() - n_germ - n_low);
+}
+
 // True if the reference has an N within +-window bp of a (1-based) position.
 // chromosome_seqs holds 0-based, null-terminated sequences; a missing chrom
 // (e.g. an ALT-contig mate absent from the reference) yields false.
@@ -1564,6 +1818,14 @@ void Caller::print_vcf_header() {
          << endl;
   }
   cout << "##FILTER=<ID=PASS,Description=\"All filters passed\">" << endl;
+  cout << "##FILTER=<ID=GERMLINE,Description=\"At least --gate-min-reads "
+          "normal reads carry the same allele (compared against ALEN, or SVLEN "
+          "when no ALEN exists): the call is not somatic\">"
+       << endl;
+  cout << "##FILTER=<ID=LOWPOWER,Description=\"Too few normal reads on the "
+          "haplotype the event sits on for its absence from the normal to be "
+          "informative: not evidence of germline, absence of evidence\">"
+       << endl;
   cout << "##INFO=<ID=VARTYPE,Number=A,Type=String,Description=\"Variant "
           "class\">"
        << endl;
@@ -1629,6 +1891,52 @@ void Caller::print_vcf_header() {
   cout << "##INFO=<ID=COV2,Number=1,Type=Integer,Description=\"Total "
           "number of "
           "alignments covering this locus (HP=2)\">"
+       << endl;
+  // Germline/somatic evidence (see CallStats in sv.hpp). Descriptive only: no
+  // record is filtered on any of these.
+  cout << "##INFO=<ID=HP1,Number=1,Type=Integer,Description=\"Supporting "
+          "reads of this record with HP=1\">"
+       << endl;
+  cout << "##INFO=<ID=HP2,Number=1,Type=Integer,Description=\"Supporting "
+          "reads of this record with HP=2\">"
+       << endl;
+  cout << "##INFO=<ID=HP0,Number=1,Type=Integer,Description=\"Supporting "
+          "reads of this record with no HP tag\">"
+       << endl;
+  cout << "##INFO=<ID=NSUP,Number=1,Type=Integer,Description=\"Supporting "
+          "reads located in the tumour BAM at this locus\">"
+       << endl;
+  cout << "##INFO=<ID=ALEN,Number=1,Type=Integer,Description=\"Median "
+          "same-type indel length carried by the supporting reads (0 for "
+          "BND/DUP/INV). Comparable with NLENS; may differ from SVLEN\">"
+       << endl;
+  cout << "##INFO=<ID=ALENMIN,Number=1,Type=Integer,Description=\"Shortest "
+          "indel length among the supporting reads\">"
+       << endl;
+  cout << "##INFO=<ID=ALENMAX,Number=1,Type=Integer,Description=\"Longest "
+          "indel length among the supporting reads\">"
+       << endl;
+  cout << "##INFO=<ID=NEXAM,Number=1,Type=Integer,Description=\"Normal reads "
+          "passing MAPQ and spanning the breakpoint (germline filter)\">"
+       << endl;
+  cout << "##INFO=<ID=NLOWQ,Number=1,Type=Integer,Description=\"Normal reads "
+          "discarded for MAPQ below --min-mapq\">"
+       << endl;
+  cout << "##INFO=<ID=NCONC,Number=1,Type=Integer,Description=\"Normal reads "
+          "carrying a same-type indel of at least --min-sv-length, whatever "
+          "its length\">"
+       << endl;
+  cout << "##INFO=<ID=NHP1,Number=1,Type=Integer,Description=\"Spanning normal "
+          "reads with HP=1\">"
+       << endl;
+  cout << "##INFO=<ID=NHP2,Number=1,Type=Integer,Description=\"Spanning normal "
+          "reads with HP=2\">"
+       << endl;
+  cout << "##INFO=<ID=NHP0,Number=1,Type=Integer,Description=\"Spanning normal "
+          "reads with no HP tag\">"
+       << endl;
+  cout << "##INFO=<ID=NLENS,Number=.,Type=Integer,Description=\"Lengths of "
+          "same-type indels seen in normal reads near the breakpoint\">"
        << endl;
   cout << "##INFO=<ID=AS,Number=1,Type=Integer,Description=\"Alignment "
           "score\">"

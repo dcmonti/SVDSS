@@ -80,7 +80,7 @@ ostream &operator<<(ostream &os, const SV &sv) {
      << sv.altall << "\t"
      << "."
      << "\t"
-     << "PASS"
+     << sv.filter
      << "\t"
      // INFO
      << "VARTYPE=SV;"
@@ -121,6 +121,30 @@ ostream &operator<<(ostream &os, const SV &sv) {
   // came out of a single D operation prints exactly what it printed before.
   if (sv.del_parts > 1)
     os << "DELPARTS=" << sv.del_parts << ";DELKEPT=" << sv.del_kept << ";";
+  // Germline/somatic evidence, filled by Caller::collect_call_stats() for every
+  // record that is written, on both the POA and the clipped path. The normal
+  // block appears only when a normal BAM was given, so a record with no NEXAM is
+  // one where the normal was never looked at rather than one found empty.
+  os << "HP1=" << sv.stats.hp1 << ";HP2=" << sv.stats.hp2 << ";HP0="
+     << sv.stats.hp0 << ";"
+     << "NSUP=" << sv.stats.n_sup << ";"
+     << "ALEN=" << sv.stats.alen_med << ";ALENMIN=" << sv.stats.alen_min
+     << ";ALENMAX=" << sv.stats.alen_max << ";";
+  if (sv.stats.n_exam >= 0) {
+    os << "NEXAM=" << sv.stats.n_exam << ";NLOWQ=" << sv.stats.n_lowq
+       << ";NCONC=" << sv.stats.n_conc << ";"
+       << "NHP1=" << sv.stats.nhp1 << ";NHP2=" << sv.stats.nhp2 << ";NHP0="
+       << sv.stats.nhp0 << ";";
+    // Raw lengths, not a summary: the whole point is to be able to re-test
+    // concordance against a length other than SVLEN.
+    os << "NLENS=";
+    if (sv.stats.n_lens.empty())
+      os << ".";
+    else
+      for (size_t i = 0; i < sv.stats.n_lens.size(); ++i)
+        os << (i ? "," : "") << sv.stats.n_lens[i];
+    os << ";";
+  }
   os << "RVEC=" << sv.rvec << ";"
     << "READS=" << sv.reads << ";"
     << "SA_READS=" << sv.sa_reads

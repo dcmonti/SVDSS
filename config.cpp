@@ -54,6 +54,11 @@ Configuration::Configuration()
     ("germline-diff-max", "", cxxopts::value<int>()) // difference-based germline: |sv_len-normal_len| < this (0=min_sv_length)
     ("germline-diff-min-len", "", cxxopts::value<int>()) // difference-based germline: min normal-indel length
     ("no-germline-diff", "", cxxopts::value<bool>()->default_value("false")) // disable difference-based germline test
+    ("no-gates", "", cxxopts::value<bool>()->default_value("false"))     // disable the post-call GERMLINE/LOWPOWER gates
+    ("gate-min-reads", "", cxxopts::value<int>())                        // normal reads matching ALEN to drop a call as germline
+    ("gate-tol-frac", "", cxxopts::value<float>())                       // relative tolerance of the ALEN match
+    ("gate-q", "", cxxopts::value<float>())                              // P(a normal read of the right haplotype shows a het)
+    ("gate-conf", "", cxxopts::value<float>())                           // below this confidence a call is flagged LOWPOWER
     ("diploid-poa", "", cxxopts::value<bool>()->default_value("false")) // emit up to two POA consensuses per cluster (now ON by default: kept as a no-op for backwards compatibility)
     ("no-diploid-poa", "", cxxopts::value<bool>()->default_value("false")) // single POA consensus per cluster
     ("poa-min-freq", "", cxxopts::value<float>()) // min allele fraction for diploid-poa split
@@ -139,6 +144,16 @@ void Configuration::parse(int argc, char **argv) {
     germline_diff_max = results["germline-diff-max"].as<int>();
   if (results.count("germline-diff-min-len"))
     germline_diff_min_len = results["germline-diff-min-len"].as<int>();
+  if (results.count("no-gates") && results["no-gates"].as<bool>())
+    gates = false;
+  if (results.count("gate-min-reads"))
+    gate_min_reads = results["gate-min-reads"].as<int>();
+  if (results.count("gate-tol-frac"))
+    gate_tol_frac = results["gate-tol-frac"].as<float>();
+  if (results.count("gate-q"))
+    gate_q = results["gate-q"].as<float>();
+  if (results.count("gate-conf"))
+    gate_conf = results["gate-conf"].as<float>();
   if (results.count("no-germline-diff") && results["no-germline-diff"].as<bool>())
     germline_diff = false;
   // diploid_poa, germline_realign and require_sfs_overlap now default to ON.

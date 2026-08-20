@@ -134,6 +134,13 @@ private:
 
   bool is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
                    int t);
+  // Fill CallStats on records about to be written (both the POA and the clipped
+  // path). Descriptive only; see the definition for why it is not folded into
+  // is_germline().
+  void collect_call_stats(vector<SV> &recs);
+  // Post-call gates: drop germline (gate A), flag LOWPOWER (gate B). Separate
+  // from collect_call_stats so that description and decision stay apart.
+  void apply_gates(vector<SV> &recs);
   // Germline check for breakend-like events (BND/INV) using the split (SA)
   // alignments of the normal contigs instead of CIGAR I/D ops.
   bool is_germline_breakend(const SV &sv, int t);
