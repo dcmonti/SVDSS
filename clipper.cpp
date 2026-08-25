@@ -564,16 +564,50 @@ void Clipper::store_clip_clusters(const vector<Clip> &lclips,
 
 vector<Clip> Clipper::filter_tooclose_clips(
     const vector<Clip> &clips,
-    unordered_map<string, interval_tree_t<int>> &vartrees) {
+    unordered_map<string, interval_tree_t<int>> &vartrees,
+    unordered_map<string, interval_tree_t<int>> &calltrees) {
   vector<Clip> fclips;
+  // Accounting only; the kept/dropped decision is unchanged.
+  size_t drop_call = 0, drop_germline = 0;
+  size_t reads_call = 0, reads_germline = 0;
+  size_t w1_call = 0;
   for (const Clip &c : clips) {
     auto it = vartrees.find(c.chrom);
     if (it == vartrees.end() ||
         it->second.overlap_find({(int)c.p, (int)c.p + 1}) ==
             end(it->second)) {
       fclips.push_back(c);
+      continue;
+    }
+    auto ct = calltrees.find(c.chrom);
+    bool near_call = false;
+    if (ct != calltrees.end()) {
+      auto hit = ct->second.overlap_find({(int)c.p, (int)c.p + 1});
+      if (hit != end(ct->second)) {
+        near_call = true;
+        // At info level, and only for clips carrying more than one read: those
+        // are the ones whose support could change a call's weight. Single-read
+        // clips are noise and would bury the signal (55 of 128 on HG008).
+        if (c.w > 1)
+          spdlog::info("[CLIP_DROP][NEAR_CALL] {}:{} w={} reads={} "
+                       "call_window={}-{}",
+                       c.chrom, c.p + 1, c.w, c.names.size(),
+                       hit->low(), hit->high());
+      }
+    }
+    if (near_call) {
+      ++drop_call;
+      reads_call += c.names.size();
+      if (c.w <= 1)
+        ++w1_call;
+    } else {
+      ++drop_germline;
+      reads_germline += c.names.size();
     }
   }
+  spdlog::info("[CLIP_FILTER][DROPPED] near a call: {} clips / {} reads "
+               "(of which w<=1: {}) | near a germline region: {} clips / {} reads",
+               drop_call, reads_call, w1_call, drop_germline, reads_germline);
   return fclips;
 }
 
@@ -607,7 +641,8 @@ int binary_search(const vector<Clip> &clips, uint begin, uint end,
 }
 
 void Clipper::call(int threads,
-                   unordered_map<string, interval_tree_t<int>> &vartrees) {
+                   unordered_map<string, interval_tree_t<int>> &vartrees,
+                   unordered_map<string, interval_tree_t<int>> &calltrees) {
   vector<Clip> rclips;
   vector<Clip> lclips;
   for (const Clip &clip : clips) {
@@ -628,7 +663,7 @@ void Clipper::call(int threads,
       spdlog::info("[CLIP_FILTER][RIGHT] after combine: {}", rclips.size());
       rclips = filter_lowcovered(rclips, 1);
       spdlog::info("[CLIP_FILTER][RIGHT] after filter_lowcovered(1): {}", rclips.size());
-      rclips = filter_tooclose_clips(rclips, vartrees);
+      rclips = filter_tooclose_clips(rclips, vartrees, calltrees);
       spdlog::info("[CLIP_FILTER][RIGHT] after filter_tooclose_clips: {}", rclips.size());
       rclips = cluster(rclips, 1000);
       spdlog::info("[CLIP_FILTER][RIGHT] after cluster(1000): {}", rclips.size());
@@ -640,7 +675,7 @@ void Clipper::call(int threads,
       spdlog::info("[CLIP_FILTER][LEFT] after combine: {}", lclips.size());
       lclips = filter_lowcovered(lclips, 1);
       spdlog::info("[CLIP_FILTER][LEFT] after filter_lowcovered(1): {}", lclips.size());
-      lclips = filter_tooclose_clips(lclips, vartrees);
+      lclips = filter_tooclose_clips(lclips, vartrees, calltrees);
       spdlog::info("[CLIP_FILTER][LEFT] after filter_tooclose_clips: {}", lclips.size());
       lclips = cluster(lclips, 1000);
       spdlog::info("[CLIP_FILTER][LEFT] after cluster(1000): {}", lclips.size());

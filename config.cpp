@@ -69,6 +69,8 @@ Configuration::Configuration()
     ("no-merge-del", "", cxxopts::value<bool>()->default_value("false")) // keep every D op of an alignment as its own DEL record
     ("merge-del-gap", "", cxxopts::value<int>()) // max gap between D ops merged into one DEL, in bp
     ("merge-del-gap-frac", "", cxxopts::value<float>()) // max gap as a fraction of the deleted bases so far
+    ("no-merge-del-xc", "", cxxopts::value<bool>()->default_value("false")) // keep deletions split across consensus alignments apart
+    ("merge-del-xc-gap", "", cxxopts::value<int>()) // max gap for the cross-consensus rejoin, in bp
     ("require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // require >=2 original SFS overlapping the SV interval (now ON by default: kept as a no-op for backwards compatibility)
     ("no-require-sfs-overlap", "", cxxopts::value<bool>()->default_value("false")) // do not require original SFS to overlap the SV interval
     ("bed-exclusion", "", cxxopts::value<std::string>()) // BED file of regions to exclude from analysis. Any SVs overlapping these regions will be filtered out.
@@ -188,6 +190,10 @@ void Configuration::parse(int argc, char **argv) {
     merge_del_max_gap = results["merge-del-gap"].as<int>();
   if (results.count("merge-del-gap-frac"))
     merge_del_max_gap_frac = results["merge-del-gap-frac"].as<float>();
+  if (results.count("no-merge-del-xc") && results["no-merge-del-xc"].as<bool>())
+    merge_del_xc = false;
+  if (results.count("merge-del-xc-gap"))
+    merge_del_xc_max_gap = results["merge-del-xc-gap"].as<int>();
   useht = !results["noht"].as<bool>();
   // noref = results["noref"].as<bool>();
   assemble = !(results["noassemble"].as<bool>());

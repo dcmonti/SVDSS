@@ -73,6 +73,8 @@ static const char CALL_USAGE_MESSAGE[] =
   "      --no-merge-del                   do not merge D operations of the same alignment split by a short aligned stretch\n"
   "      --merge-del-gap <INT>            maximum gap between merged D operations, in bp (default: 100)\n"
   "      --merge-del-gap-frac <FLOAT>     maximum gap as a fraction of the deleted bases so far (default: 0.20)\n"
+  "      --no-merge-del-xc                do not rejoin deletions split across consensus alignments\n"
+  "      --merge-del-xc-gap <INT>         maximum gap for that rejoin, in bp (default: 5000)\n"
   "      --threads <INT>                  number of threads to use (default: 4)\n"
   "      --help                           print help message\n";
 
@@ -202,6 +204,10 @@ public:
   bool merge_del = true;
   int merge_del_max_gap = 100;
   float merge_del_max_gap_frac = 0.2;
+  // Cross-consensus rejoin, keyed on the supporting reads being the SAME set.
+  // The gap cap is a backstop only: read-set identity is what makes it safe.
+  bool merge_del_xc = true;
+  int merge_del_xc_max_gap = 5000;
   int max_cluster_dist = 0; // 0 means auto-computed
 
   string bam = "";

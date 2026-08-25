@@ -127,8 +127,16 @@ private:
   vector<Clip> combine(const vector<Clip> &);
   vector<Clip> filter_lowcovered(const vector<Clip> &, const uint);
   vector<Clip> cluster(const vector<Clip> &, uint);
+  // The removal decision uses vartrees (calls + germline regions, as before).
+  // calltrees holds ONLY the POA calls and is read for accounting: a clip next
+  // to a call carries reads for an event we already report, and dropping it
+  // throws that support away instead of adding it; a clip next to a germline
+  // region is correctly gone. The two are indistinguishable once merged into a
+  // single tree, which is why the counters could not be produced before.
   vector<Clip> filter_tooclose_clips(
       const vector<Clip> &,
+      std::unordered_map<std::string,
+                         lib_interval_tree::interval_tree_t<int>> &,
       std::unordered_map<std::string,
                          lib_interval_tree::interval_tree_t<int>> &);
   void store_clip_clusters(const vector<Clip> &lclips,
@@ -140,6 +148,8 @@ public:
 
   Clipper(const vector<Clip> &);
   void call(int threads,
+            std::unordered_map<std::string,
+                               lib_interval_tree::interval_tree_t<int>> &,
             std::unordered_map<std::string,
                                lib_interval_tree::interval_tree_t<int>> &);
 };

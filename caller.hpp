@@ -137,6 +137,10 @@ private:
   // Fill CallStats on records about to be written (both the POA and the clipped
   // path). Descriptive only; see the definition for why it is not folded into
   // is_germline().
+  // Rejoins deletions that two DIFFERENT consensus alignments split apart,
+  // keyed on the supporting reads being the same set. See caller.cpp.
+  void merge_fragmented_dels(vector<SV> &recs);
+
   void collect_call_stats(vector<SV> &recs);
   // Post-call gates: drop germline (gate A), flag LOWPOWER (gate B). Separate
   // from collect_call_stats so that description and decision stay apart.

@@ -115,8 +115,11 @@ void Caller::run() {
     return abs(a.l) < abs(b.l);
   });
   filter_sv_chains();
-  spdlog::info("Writing {} SVs.", svs.size());
   sort(svs.begin(), svs.end());
+  // Needs the sort (it walks neighbours) and must precede the stats, so that a
+  // merged record is measured over its full span.
+  merge_fragmented_dels(svs);
+  spdlog::info("Writing {} SVs.", svs.size());
   collect_call_stats(svs);
   apply_gates(svs);
   write_vcf();
@@ -132,8 +135,27 @@ void Caller::run() {
     // Per-chromosome interval trees: ensures clips on chrom A cannot be
     // filtered/paired against SVs on chrom B that share a coordinate.
     unordered_map<string, interval_tree_t<int>> vartrees;
-    for (const auto &sv : svs)
-      vartrees[sv.chrom].insert({sv.s - 1000, sv.e + 1000});
+    // calltrees carries the POA calls alone. vartrees keeps holding both (the
+    // exclusion is unchanged); the split exists so the filter can say whether a
+    // dropped clip sat next to a CALL -- whose reads support an event we report
+    // and are being discarded rather than pooled -- or next to a germline
+    // region, where dropping is right. Merged in one tree the two are
+    // indistinguishable, and germline regions outnumber calls ~15 to 1.
+    unordered_map<string, interval_tree_t<int>> calltrees;
+    for (const auto &sv : svs) {
+      // An insertion consumes no reference, so sv.e == sv.s and the window is
+      // only +-1000 around POS. The SAME event reported as a tandem duplication
+      // puts its second breakpoint SVLEN away: above ~1 kb that falls outside,
+      // the clip survives the exclusion, and the event is emitted twice. On
+      // HG008 chrX:8514918 comes out both as <INS> (10 reads) and as <DUP> (9),
+      // with ZERO reads in common, because the two calling paths partition the
+      // reads -- a read either spans the insertion as a CIGAR I or is split at
+      // the breakpoint, never both. Padding by the insertion length covers the
+      // second breakpoint too.
+      const int pad = (sv.type == "INS") ? abs(sv.l) : 0;
+      vartrees[sv.chrom].insert({sv.s - 1000, sv.e + pad + 1000});
+      calltrees[sv.chrom].insert({sv.s - 1000, sv.e + pad + 1000});
+    }
     // Also exclude clips near germline-filtered events: these can produce
     // imprecise FP calls (e.g. reads soft-clipped at a germline insertion
     // boundary get paired as a spurious somatic INS or DEL).
@@ -143,7 +165,7 @@ void Caller::run() {
             {std::get<1>(r) - 1000, std::get<2>(r) + 1000});
     vector<SV> clipped_svs;
     Clipper clipper(C.clips);
-    clipper.call(config->threads, vartrees);
+    clipper.call(config->threads, vartrees, calltrees);
     int s = 0;
     for (int i = 0; i < config->threads; i++) {
       s += clipper._p_svs[i].size();
@@ -985,6 +1007,108 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
 // EMITTED record -- 201 on HG008 instead of ~1.6M clusters -- and it also
 // reaches the clipped path, which never goes through is_germline() at all and
 // accounts for every BND/DUP/INV plus the Mode-B deletions.
+static void _read_set(const SV &sv, unordered_set<string> &out) {
+  out.clear();
+  for (const string *src : {&sv.reads, &sv.sa_reads}) {
+    size_t b = 0;
+    while (b < src->size()) {
+      size_t e = src->find(',', b);
+      if (e == string::npos)
+        e = src->size();
+      if (e > b)
+        out.insert(src->substr(b, e - b));
+      b = e + 1;
+    }
+  }
+}
+
+// Deletions that two DIFFERENT consensus alignments split apart.
+//
+// merge_del (see the POA walk) rejoins D ops inside ONE consensus and stops
+// there on purpose: "two nearby calls backed by different reads are two events,
+// not one". This is the converse case -- two calls backed by the SAME reads are
+// one event that the clustering happened to cut in two, because each SFS anchor
+// grew its own tiny cluster with its own tiny consensus.
+//
+// COLO829 SV39 is the motivating case: a 4567 bp somatic deletion carried by 14
+// of 90 tumour reads and 0 of 69 normal reads (VAF 15.5%, against the AF=0.155
+// the benchmark declares), which the alignment fragments into pieces. SVDSS
+// emits a 1421 bp and a 191 bp record whose supporting read sets are identical,
+// 14 out of 14. Neither matches the benchmark; the union does, to 16 bp on the
+// left and 6 bp on the right.
+//
+// Read-set identity is the entire safety argument, and it is a strict one: over
+// the two benchmark callsets this fires on exactly that one pair on COLO829 and
+// on nothing at all on HG008, at any gap up to 10 kb. A gap cap is still
+// applied, so that two genuinely separate deletions that happen to sit on the
+// same molecules do not collapse into one.
+void Caller::merge_fragmented_dels(vector<SV> &recs) {
+  if (!config->merge_del_xc || recs.size() < 2)
+    return;
+  vector<SV> out;
+  out.reserve(recs.size());
+  unordered_set<string> ra, rb;
+  size_t n_merged = 0;
+  for (size_t i = 0; i < recs.size();) {
+    if (recs[i].type != "DEL") {
+      out.push_back(recs[i]);
+      ++i;
+      continue;
+    }
+    size_t last = i;
+    int deleted = abs(recs[i].l);
+    _read_set(recs[i], ra);
+    while (!ra.empty() && last + 1 < recs.size()) {
+      const SV &nxt = recs[last + 1];
+      if (nxt.type != "DEL" || nxt.chrom != recs[last].chrom)
+        break;
+      const int gap = nxt.s - recs[last].e;
+      if (gap < 0 || gap > config->merge_del_xc_max_gap)
+        break;
+      _read_set(nxt, rb);
+      if (rb != ra)
+        break;
+      deleted += abs(nxt.l);
+      ++last;
+    }
+    if (last == i) {
+      out.push_back(recs[i]);
+      ++i;
+      continue;
+    }
+    const uint start = recs[i].s;
+    const uint span = recs[last].e - start;
+    SV sv = SV("DEL", recs[i].chrom, start,
+               string(chromosome_seqs[recs[i].chrom] + start - 1, span),
+               string(chromosome_seqs[recs[i].chrom] + start - 1, 1), recs[i].w,
+               recs[i].cov, recs[i].ngaps, recs[i].score, recs[i].imprecise,
+               span, recs[i].cigar);
+    sv.set_cov(recs[i].cov, recs[i].cov0, recs[i].cov1, recs[i].cov2);
+    sv.gt = recs[i].gt;
+    sv.gtq = recs[i].gtq;
+    sv.rvec = recs[i].rvec;
+    sv.reads = recs[i].reads;
+    sv.sa_reads = recs[i].sa_reads;
+    // Additive, like the in-consensus merge: SVLEN stays the full POS..END span
+    // and del_kept says how many of those bases the alignments did NOT delete.
+    sv.del_parts = (int)(last - i + 1);
+    sv.del_kept = (int)span - deleted;
+    spdlog::info("[MERGE_DEL_XC] {} + {} more -> {}:{}-{} span={} deleted={} "
+                 "kept={} reads={}",
+                 recs[i].idx, last - i, sv.chrom, sv.s, sv.e, span, deleted,
+                 sv.del_kept, ra.size());
+    out.push_back(sv);
+    n_merged += last - i;
+    i = last + 1;
+  }
+  if (n_merged) {
+    spdlog::info("[MERGE_DEL_XC] {} fragmented deletion(s) absorbed, {} -> {} "
+                 "records",
+                 n_merged, recs.size(), out.size());
+    recs.swap(out);
+  }
+}
+
 void Caller::collect_call_stats(vector<SV> &recs) {
   if (recs.empty())
     return;
@@ -1015,17 +1139,7 @@ void Caller::collect_call_stats(vector<SV> &recs) {
     // these from the VCF plus the BAM.
     if (tbam && tidx && thdr) {
       unordered_set<string> want_names;
-      for (const string *src : {&sv.reads, &sv.sa_reads}) {
-        size_t b = 0;
-        while (b < src->size()) {
-          size_t e = src->find(',', b);
-          if (e == string::npos)
-            e = src->size();
-          if (e > b)
-            want_names.insert(src->substr(b, e - b));
-          b = e + 1;
-        }
-      }
+      _read_set(sv, want_names);
       if (!want_names.empty()) {
         hts_itr_t *it = sam_itr_querys(tidx, thdr, region.c_str());
         if (it) {
