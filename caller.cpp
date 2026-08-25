@@ -1003,8 +1003,7 @@ bool Caller::is_germline(const SV &sv, const string &chrom, int cl_s, int cl_e,
 // Why a separate pass instead of collecting inside is_germline(): that function
 // is a decision, and it is cheap because it stops at the first concordant
 // normal read. Gathering full counts there meant scanning the whole locus for
-// every candidate cluster and cost 2.1x runtime. Here the scan runs once per
-// EMITTED record -- 201 on HG008 instead of ~1.6M clusters -- and it also
+// every candidate cluster and cost 2.1x runtime. Here the scan runs once and
 // reaches the clipped path, which never goes through is_germline() at all and
 // accounts for every BND/DUP/INV plus the Mode-B deletions.
 static void _read_set(const SV &sv, unordered_set<string> &out) {

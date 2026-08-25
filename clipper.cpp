@@ -586,8 +586,7 @@ vector<Clip> Clipper::filter_tooclose_clips(
       if (hit != end(ct->second)) {
         near_call = true;
         // At info level, and only for clips carrying more than one read: those
-        // are the ones whose support could change a call's weight. Single-read
-        // clips are noise and would bury the signal (55 of 128 on HG008).
+        // are the ones whose support could change a call's weight. 
         if (c.w > 1)
           spdlog::info("[CLIP_DROP][NEAR_CALL] {}:{} w={} reads={} "
                        "call_window={}-{}",
