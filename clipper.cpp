@@ -872,10 +872,10 @@ void Clipper::call(int threads,
     // them by an accident of alignment: clip extraction skips supplementary
     // alignments (clusterer.cpp), so each breakend only counts the reads whose
     // PRIMARY segment landed on its side — minimap2 picks the longer segment,
-    // which has nothing to do with the strength of the evidence. A 13-read
-    // junction seen as 10+3 loses the 3-side (and with it the only breakend the
-    // truth set may be anchored on); seen as 7+6 it would lose both and the
-    // event disappears entirely. Pair the two breakends by their (chrom, pos)
+    // which has nothing to do with the strength of the evidence. A junction whose
+    // reads split unevenly loses the weaker breakend to the support threshold;
+    // split evenly it can lose both, and the event disappears entirely. Pair the
+    // two breakends by their (chrom, pos)
     // couple: each side already names the other, so the couple normalised by
     // (chrom, pos) order is the same key from either side.
     auto bnd_key = [](const Clip &c, bool is_left, string &key, uint &s,

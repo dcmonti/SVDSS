@@ -134,9 +134,9 @@ public:
   // SV (bounds cost in high-depth/repeat loci). Reads below min_mapq are
   // skipped. The filter queries config.normal_contigs_bam, which may point at a
   // normal *reads* BAM instead of contigs.
-  // min_reads=1: measured on HG008 at both coverages, a single concordant normal
-  // read is enough. 15x len50/w5: FP 28->20 at the cost of 1 TP. 60x len50/w15:
-  // FP 31->27, recall unchanged on the v0.3 PASS truth set.
+  // min_reads=1: one concordant normal read is enough, because a somatic event
+  // has no normal support at all -- a single concordant read contradicts the
+  // somatic hypothesis rather than weakly disfavouring it.
   int germline_min_reads = 1;
   int germline_max_reads = 1000;
   // Difference-based germline concordance (union with the ratio test above). A
@@ -167,13 +167,11 @@ public:
   // large to realign cheaply).
   // Post-call gates, evaluated once on the records that are about to be written
   // (see Caller::apply_gates). They do NOT replace the germline filter that runs
-  // during calling: that one removes 1246 of 1419 candidates on HG008, using
-  // min_reads=1 and the ksw2 realign. These act on what survives it, and the one
-  // thing they add is the comparison against ALEN -- the length the supporting
-  // reads carry -- which the in-call filter cannot make because all it has is
-  // SVLEN, and on some VNTRs the two differ (a DEL reported at 77 bp whose reads
-  // all carry 467).
-  //   GERMLINE: >= gate_min_reads normal reads carry the same allele -> dropped.
+  // during calling.
+  //   GERMLINE: >= gate_min_reads normal reads carry the same allele -> kept,
+  //             FILTER=GERMLINE. FLAGGED, not dropped: the threshold is
+  //             empirical, so the record stays auditable and
+  //             `bcftools view -f PASS` gives the same set a hard drop would.
   //   LOWPOWER: too little normal depth ON THE EVENT'S HAPLOTYPE for "absent
   //             from the normal" to mean anything -> kept, FILTER=LOWPOWER.
   bool gates = true;

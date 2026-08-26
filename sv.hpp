@@ -23,9 +23,9 @@ using namespace std;
 //
 //   2. Could we even have seen it?  A germline het sits on ONE haplotype, so
 //      the power to exclude it is set by the normal depth on THAT haplotype,
-//      not by the total. nhp1/nhp2 vs hp1/hp2 make that computable: on HG008,
-//      three calls had 5-6 normal reads all from the haplotype opposite the
-//      event, where total depth alone looked like adequate evidence of absence.
+//      not by the total. nhp1/nhp2 vs hp1/hp2 make that computable: a locus can
+//      carry several normal reads all from the haplotype opposite the event,
+//      where total depth alone looks like adequate evidence of absence.
 //
 // -1 means "not evaluated" (no normal BAM given) and must not be read as zero.
 // n_lens/n_conc stay empty for BND/DUP/INV, which carry no indel to compare;
@@ -39,7 +39,7 @@ struct CallStats {
   // alen is measured the same way NLENS is measured on the normal, so the two
   // are directly comparable -- which SVLEN and NLENS are not, because SVLEN
   // comes out of the consensus alignment and can differ from every read that
-  // built it (HG008: a DEL reported at 77 bp whose reads all carry 467).
+  // built it: a DEL can be reported at one length while its reads carry another.
   int hp1 = 0, hp2 = 0, hp0 = 0;
   int alen_med = 0, alen_min = 0, alen_max = 0;
   int n_sup = 0; // supporting reads actually found in the tumour BAM
@@ -71,10 +71,9 @@ public:
   string gt;
   // Only set_gt() ever writes gtq, and only the POA path calls it. The clipped
   // path builds its records straight from the constructor, so without a default
-  // here every clipped call printed whatever happened to be on the stack: on
-  // HG008 that read 0 for 108 of 116 clipped records and garbage (1,
-  // -2010473030, 1886501328) for the rest, which also made two runs of the same
-  // binary disagree. 0 is the honest value for a path that computes no
+  // here every clipped call printed whatever happened to be on the stack, which
+  // also made two runs of the same binary disagree. 0 is the honest value for a
+  // path that computes no
   // genotype quality, and matches the neutral gt/rvec the constructor sets.
   int gtq = 0;
   bool imprecise;

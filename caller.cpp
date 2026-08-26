@@ -146,12 +146,11 @@ void Caller::run() {
       // An insertion consumes no reference, so sv.e == sv.s and the window is
       // only +-1000 around POS. The SAME event reported as a tandem duplication
       // puts its second breakpoint SVLEN away: above ~1 kb that falls outside,
-      // the clip survives the exclusion, and the event is emitted twice. On
-      // HG008 chrX:8514918 comes out both as <INS> (10 reads) and as <DUP> (9),
-      // with ZERO reads in common, because the two calling paths partition the
-      // reads -- a read either spans the insertion as a CIGAR I or is split at
-      // the breakpoint, never both. Padding by the insertion length covers the
-      // second breakpoint too.
+      // the clip survives the exclusion, and the event is emitted twice. The two
+      // records share NO supporting read, because the calling paths partition
+      // them: a read either spans the insertion as a CIGAR I or is split at the
+      // breakpoint, never both, so neither record looks anomalous on its own.
+      // Padding by the insertion length covers the second breakpoint too.
       const int pad = (sv.type == "INS") ? abs(sv.l) : 0;
       vartrees[sv.chrom].insert({sv.s - 1000, sv.e + pad + 1000});
       calltrees[sv.chrom].insert({sv.s - 1000, sv.e + pad + 1000});
@@ -1029,18 +1028,15 @@ static void _read_set(const SV &sv, unordered_set<string> &out) {
 // one event that the clustering happened to cut in two, because each SFS anchor
 // grew its own tiny cluster with its own tiny consensus.
 //
-// COLO829 SV39 is the motivating case: a 4567 bp somatic deletion carried by 14
-// of 90 tumour reads and 0 of 69 normal reads (VAF 15.5%, against the AF=0.155
-// the benchmark declares), which the alignment fragments into pieces. SVDSS
-// emits a 1421 bp and a 191 bp record whose supporting read sets are identical,
-// 14 out of 14. Neither matches the benchmark; the union does, to 16 bp on the
-// left and 6 bp on the right.
+// The configuration this addresses is a low-VAF deletion that the alignment
+// fragments into pieces: the caller emits two short records whose supporting
+// read sets are identical, and neither reproduces the event while their union
+// does.
 //
-// Read-set identity is the entire safety argument, and it is a strict one: over
-// the two benchmark callsets this fires on exactly that one pair on COLO829 and
-// on nothing at all on HG008, at any gap up to 10 kb. A gap cap is still
-// applied, so that two genuinely separate deletions that happen to sit on the
-// same molecules do not collapse into one.
+// Read-set identity is the entire safety argument, and it is a strict one:
+// distinct events are not normally carried by exactly the same molecules. A gap
+// cap is still applied, so that two genuinely separate deletions that happen to
+// sit on the same molecules do not collapse into one.
 void Caller::merge_fragmented_dels(vector<SV> &recs) {
   if (!config->merge_del_xc || recs.size() < 2)
     return;
@@ -1196,8 +1192,8 @@ void Caller::collect_call_stats(vector<SV> &recs) {
       if (aln->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP))
         continue;
       if ((int)aln->core.qual < (int)config->min_mapq) {
-        ++lowq; // counted, not silently dropped: min_mapq is 60 on the HG008
-                // run and in repeats it can hide the germline evidence itself
+        ++lowq; // counted, not silently dropped: min_mapq can be set high, and
+                // in repeats it can hide the germline evidence itself
         continue;
       }
       if (aln->core.pos > sv.s || (int)(bam_endpos(aln) - 1) < sv.s)
@@ -1263,18 +1259,18 @@ void Caller::collect_call_stats(vector<SV> &recs) {
 // GATE A -- GERMLINE. The normal carries the same allele, so the call is not
 // somatic. Tested against ALEN (what the supporting reads carry) and only
 // against SVLEN when no ALEN exists, because the two disagree exactly where the
-// in-call germline filter fails: a VNTR deletion reported at 77 bp whose reads
-// and whose normal both carry 467. Records that fail it are FLAGGED, not
-// dropped: the threshold is calibrated on 32 false positives from one sample,
-// so the call stays in the file where it can be audited, and `bcftools view -f
-// PASS` gives the same set a hard drop would have produced.
+// in-call germline filter fails: at a VNTR the reported length can differ from
+// the length the reads carry, and the normal is then compared against a length
+// no read holds. Records that fail the gate are FLAGGED, not dropped -- the
+// threshold is empirical -- so the call stays in the file where it can be
+// audited, and `bcftools view -f PASS` gives the same set a hard drop would.
 //
 // GATE B -- LOWPOWER. A germline het sits on ONE haplotype, so the power to
 // exclude it is set by the normal depth on THAT haplotype. Zero reads from the
 // event's haplotype means "absent from the normal" carries no information, no
-// matter how deep the locus looks in total: on HG008 one call had 8 normal
-// reads (98.3% confidence by total depth) of which zero came from the haplotype
-// the event sits on (0% confidence). These records are NOT dropped -- the
+// matter how deep the locus looks in total: a locus with several spanning normal
+// reads, all of them from the other haplotype, tests nothing. These records are
+// NOT dropped -- the
 // evidence is missing, not contrary -- they are flagged so that PASS keeps its
 // meaning and the record survives in the full callset.
 //
@@ -1452,11 +1448,10 @@ bool Caller::is_germline_breakend(const SV &sv, int t) {
   } else { // INS
     mate_chrom = sv.chrom;
     // A clipped insertion is a replacement: the SA segment resumes ref_gap bases
-    // downstream, not at POS. Assuming adjacency made the filter blind to every
-    // germline replacement whose gap exceeds W — on COLO829 all four clipped INS
-    // false positives were germline events with 24-80 supporting split reads in
-    // the normal, each sitting 616-1340 bp outside the window. ref_gap is 0 for
-    // a pure insertion, so this is inert on the POA path.
+    // downstream, not at POS. Assuming adjacency makes the filter blind to any
+    // germline replacement whose gap exceeds the search window, however many
+    // split reads support it in the normal. ref_gap is 0 for a pure insertion,
+    // so this is inert on the POA path.
     mate_pos = (long)sv.s + sv.ref_gap;
     strand_req = 1;
   }
