@@ -107,6 +107,36 @@ struct Clip {
   bool operator<(const Clip &c) const { return p < c.p; }
 };
 
+// A cross-chromosomal (or long-range) breakend whose clip evidence is below
+// min_cluster_weight. Caller rescues these by counting, on the tumour BAM, the
+// reads that cross the SAME junction but reach this locus as a HARD-CLIPPED
+// SUPPLEMENTARY alignment instead of a soft-clipped primary — those never
+// produce a Clip, so the clip weight systematically undercounts the junction.
+//
+// The canonical case is a short foreign fragment inserted between two loci
+// (COLO829 truthset_52/53: 201 bp of chr20 spliced between chr15:23440460 and
+// chr15:23461732). Every crossing read has three segments, and which one is
+// primary decides whether the read is visible here: 6 reads had their primary
+// at chr15:23461732 and formed the cluster, 15 more crossed the very same
+// junction with a `11587H331=` supplementary and were invisible. 6 < gate 8, so
+// a junction with 21 reads of support was dropped.
+//
+// The partner side cannot help through the existing reciprocal BND pooling:
+// a 201 bp inserted fragment is *always* a supplementary, never a primary with
+// soft clips, so it yields no clip cluster to pool with.
+struct ClipBndCand {
+  string chrom;
+  uint p;
+  string alt;          // full breakend ALT, geometry already resolved here
+  string refbase;
+  string sa_chrom;     // partner locus, for the BAM lookup
+  uint sa_pos;
+  uint sa_ref_len;
+  uint clip_w;         // pooled clip-side support (< min_cluster_weight)
+  vector<string> names;
+  vector<string> sa_names; // already counted: excluded from the rescue tally
+};
+
 // A deletion whose pooled clip evidence is below min_cluster_weight but short
 // enough (< ~15 kbp) that minimap2 may also represent it as through-reads (a
 // single D op) rather than clips. Caller rescues these by counting the
@@ -126,7 +156,8 @@ private:
   vector<Clip> remove_duplicates(const vector<Clip> &);
   vector<Clip> combine(const vector<Clip> &);
   vector<Clip> filter_lowcovered(const vector<Clip> &, const uint);
-  vector<Clip> cluster(const vector<Clip> &, uint);
+  // The third argument is only a label ("L"/"R") for the diagnostic vote dump.
+  vector<Clip> cluster(const vector<Clip> &, uint, const char *side);
   // The removal decision uses vartrees (calls + germline regions, as before).
   // calltrees holds ONLY the POA calls and is read for accounting: a clip next
   // to a call carries reads for an event we already report, and dropping it
@@ -141,10 +172,19 @@ private:
                          lib_interval_tree::interval_tree_t<int>> &);
   void store_clip_clusters(const vector<Clip> &lclips,
                            const vector<Clip> &rclips);
+  // One line per SA vote group per clip cluster, collected inside cluster()
+  // and written next to the clip-cluster TSV. store_clip_clusters can only
+  // ever show the WINNING group, because the dump happens after
+  // apply_sa_winner has already collapsed the cluster onto it; the losing
+  // groups are what explain why a breakend got the geometry it got, so they
+  // need their own record. Populated only when --clip-clusters is given.
+  vector<string> vote_dump;
+  void store_vote_groups();
 
 public:
   vector<vector<SV>> _p_svs;
   vector<ClipDelCand> prov_dels; // sub-threshold DELs for Mode B rescue
+  vector<ClipBndCand> prov_bnds; // sub-threshold BNDs, rescued on the BAM
 
   Clipper(const vector<Clip> &);
   void call(int threads,

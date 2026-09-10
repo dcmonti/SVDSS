@@ -8,6 +8,23 @@ namespace {
 // selection. Long-read split alignments at the same SV breakpoint usually
 // agree to within a few tens of bp; 200 bp is a generous upper bound.
 constexpr uint SA_VOTE_POS_TOL = 200;
+// Floor on a sub-threshold BND cluster's own clip support before it is
+// offered to the supplementary-alignment rescue (see ClipBndCand). On
+// COLO829 there are 86 BND clusters above the gate and 14230 below, of which
+// 13481 hold a single read: without a floor the rescue would run 14230 BAM
+// lookups and let any single-read pile-up in a repeat be promoted by seven
+// spurious partners. At 3 it considers 62 clusters genome-wide.
+constexpr uint CLIP_BND_RESCUE_MIN_W = 3;
+// A clip cluster only qualifies for the rescue if the SA-carrying reads are
+// at least this fraction (expressed as a 1/N) of the whole cluster. A
+// mappability-boundary pile-up stacks many reads soft-clipping at the same
+// position for unrelated reasons while only a few carry the breakend's SA
+// (the same hazard sa_vote_add already guards against by weighting votes with
+// sa_names rather than w): promoting one of those on partner-side evidence is
+// how the rescue would manufacture false positives. On COLO829 the two
+// rescued candidates separate cleanly on exactly this ratio -- truthset_53 has
+// nsa/w = 6/6, the one false positive 6/20.
+constexpr uint CLIP_BND_RESCUE_MIN_SA_FRAC_INV = 2; // nsa*2 >= w
 
 struct SAGroup {
   string sa_chrom;
@@ -107,6 +124,25 @@ static uint sa_junction(const Clip &c) {
   return c.starting ? c.sa_pos : (c.sa_pos + c.sa_ref_len);
 }
 
+// Breakend ALT for a clip cluster, in ONE place so the emission and the
+// sub-threshold rescue candidate can never disagree on the geometry.
+//
+// `mate` is the SA end adjacent to the junction. For a LEFT clip the primary
+// lies to the RIGHT of the breakend, so the mate piece precedes refbase and the
+// adjacent SA end is sa_pos+sa_ref_len when both segments map on the same
+// strand; a RIGHT clip is the mirror image. ']' keeps the mate piece forward,
+// '[' takes it reverse-complemented.
+static string bnd_alt(const Clip &c, bool is_left, const string &refbase) {
+  const bool same_strand = (c.primary_reverse == c.sa_reverse);
+  const uint mate = is_left
+                        ? (same_strand ? c.sa_pos + c.sa_ref_len : c.sa_pos)
+                        : (same_strand ? c.sa_pos : c.sa_pos + c.sa_ref_len);
+  const string br =
+      is_left ? (same_strand ? "]" : "[") : (same_strand ? "[" : "]");
+  const string m = br + c.sa_chrom + ":" + to_string(mate) + br;
+  return is_left ? m + refbase : refbase + m;
+}
+
 static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
   if (!c.sa_has_info)
     return;
@@ -157,32 +193,36 @@ static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
 // interval. Fall back to the plain max-vote winner only when every group is
 // degenerate (the clip is then discarded downstream anyway). Cross-chromosome
 // (BND) groups are never degenerate: their junction is on another contig.
+// Extracted from sa_vote_winner so that the vote and the diagnostic dump
+// (store_vote_groups) share one definition and cannot drift apart.
+//
+// Same predicate the emission branches use, so the vote and the call agree by
+// construction. A reference gap below min_sv_length does not make a group
+// useless: an insertion has no reference gap at all and takes its length from
+// the QUERY gap, so a group is degenerate only when it can yield neither a
+// deletion nor an insertion.
+static bool sa_group_degenerate(const SAGroup &g, const string &clip_chrom,
+                                uint clip_pos) {
+  if (g.sa_chrom != clip_chrom)
+    return false; // cross-contig: the junction is elsewhere, never degenerate
+  long long dR = (long long)g.junction - (long long)clip_pos;
+  if (dR < 0)
+    dR = -dR;
+  const long long m = (long long)Configuration::getInstance()->min_sv_length;
+  const long long dQ = median_int(g.dqs);
+  const bool viable_del = dR > dQ + m;
+  const bool viable_ins = dQ > dR + m;
+  return !(viable_del || viable_ins);
+}
+
 static bool sa_vote_winner(const vector<SAGroup> &groups,
                            const string &clip_chrom, uint clip_pos,
-                           SAGroup &winner) {
+                           SAGroup &winner, int *winner_idx = nullptr) {
   if (groups.empty())
     return false;
-  const uint min_len = Configuration::getInstance()->min_sv_length;
-  auto degenerate = [&](const SAGroup &g) {
-    if (g.sa_chrom != clip_chrom)
-      return false; // cross-contig: the junction is elsewhere, never degenerate
-    long long dR = (long long)g.junction - (long long)clip_pos;
-    if (dR < 0)
-      dR = -dR;
-    // Same predicate the emission branches use, so the vote and the call agree
-    // by construction. A reference gap below min_sv_length does not make a
-    // group useless: an insertion has no reference gap at all and takes its
-    // length from the QUERY gap, so a group is degenerate only when it can
-    // yield neither a deletion nor an insertion.
-    const long long dQ = median_int(g.dqs);
-    const long long m = (long long)min_len;
-    const bool viable_del = dR > dQ + m;
-    const bool viable_ins = dQ > dR + m;
-    return !(viable_del || viable_ins);
-  };
   int best = -1;
   for (uint i = 0; i < groups.size(); ++i) {
-    if (degenerate(groups[i]))
+    if (sa_group_degenerate(groups[i], clip_chrom, clip_pos))
       continue;
     if (best < 0 || groups[i].count > groups[best].count)
       best = (int)i;
@@ -195,6 +235,8 @@ static bool sa_vote_winner(const vector<SAGroup> &groups,
         best = (int)i;
   }
   winner = groups[best];
+  if (winner_idx != nullptr)
+    *winner_idx = best;
   return true;
 }
 
@@ -415,7 +457,9 @@ vector<Clip> Clipper::filter_lowcovered(const vector<Clip> &clips,
 // Cluster clips by proximity. Clustering is performed independently for each
 // chromosome so that nearby positions on different chroms cannot be merged.
 // TODO: this might be too slow
-vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
+vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r,
+                              const char *side) {
+  const bool dump = !Configuration::getInstance()->clip_clusters.empty();
   unordered_map<string, vector<Clip>> by_chrom;
   for (const Clip &c : clips)
     by_chrom[c.chrom].push_back(c);
@@ -428,7 +472,11 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
       bool found = false;
       for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
            it != clusters_by_pos.end(); ++it) {
-        if (it->first - r <= c.p && c.p <= it->first + r) {
+        // `it->first - r` on uint underflows for cluster keys below r,
+        // making the test always false: no clip could ever merge into a
+        // cluster seeded in the first r bases of a contig. Compare with
+        // the addition on the other side instead.
+        if (c.p + r >= it->first && c.p <= it->first + r) {
           found = true;
           it->second.l = max(it->second.l, c.l);
           it->second.w += c.w;
@@ -443,6 +491,14 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
               append_name(it->second.sa_names, c.name);
           }
           sa_vote_add(sa_votes_by_pos[it->first], c);
+          // One clip belongs to ONE cluster. Without this break the loop keeps
+          // going and a clip that sits within r of two cluster keys is merged
+          // into BOTH: its `w` is counted twice and its SA votes in two
+          // separate ballots. Since clusters_by_pos is a std::map the scan is
+          // in ascending key order, so the clip lands in the leftmost cluster
+          // that covers it -- not necessarily the nearest one, which would be
+          // more principled but is a separate behavioural change.
+          break;
         }
       }
       if (!found) {
@@ -456,9 +512,33 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r) {
     for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
          it != clusters_by_pos.end(); ++it) {
       SAGroup winner;
-      if (sa_vote_winner(sa_votes_by_pos[it->first], kv.first, it->first,
-                         winner))
-        apply_sa_winner(it->second, winner, sa_votes_by_pos[it->first]);
+      int widx = -1;
+      const vector<SAGroup> &gs = sa_votes_by_pos[it->first];
+      if (sa_vote_winner(gs, kv.first, it->first, winner, &widx))
+        apply_sa_winner(it->second, winner, gs);
+      if (dump && !gs.empty()) {
+        // Record every competing group, not just the winner: which group won
+        // and by how much is the whole explanation of a breakend's geometry.
+        // Built into a local buffer and appended under one critical section,
+        // because cluster() runs concurrently for the L and R sides.
+        string buf;
+        for (uint gi = 0; gi < gs.size(); ++gi) {
+          const SAGroup &g = gs[gi];
+          buf += string(side) + "\t" + kv.first + ":" +
+                 to_string(it->first + 1) + "\t" + to_string(gs.size()) +
+                 "\t" + to_string(gi) + "\t" + g.sa_chrom + ":" +
+                 to_string(g.sa_pos) + "\t" + to_string(g.sa_ref_len) + "\t" +
+                 to_string(g.sa_query_start) + "\t" +
+                 to_string(g.sa_query_len) + "\t" +
+                 strands_to_string(g.primary_reverse, g.sa_reverse) + "\t" +
+                 to_string(g.junction) + "\t" + to_string(g.count) + "\t" +
+                 to_string(median_int(g.dqs)) + "\t" +
+                 (sa_group_degenerate(g, kv.first, it->first) ? "DEG" : ".") +
+                 "\t" + ((int)gi == widx ? "WIN" : ".") + "\n";
+        }
+#pragma omp critical(vote_dump)
+        vote_dump.push_back(buf);
+      }
       clusters.push_back(it->second);
     }
   }
@@ -573,6 +653,25 @@ void Clipper::store_clip_clusters(const vector<Clip> &lclips,
   f.close();
 }
 
+// Companion of store_clip_clusters: the competing SA vote groups, one line per
+// group. Written to <clip_clusters>.votes so the two files can be joined on the
+// cluster key. See the vote_dump comment in clipper.hpp for why the winner-only
+// view of the clip-cluster TSV is not enough.
+void Clipper::store_vote_groups() {
+  Configuration *config = Configuration::getInstance();
+  if (config->clip_clusters.empty() || vote_dump.empty())
+    return;
+  ofstream f;
+  f.open(config->clip_clusters + ".votes");
+  f << "#SVDSS SA vote groups per clip cluster\n";
+  f << "#fields=side\tchrom:cluster_p_1based\tn_groups\tgroup_idx"
+       "\tsa_chrom:sa_pos\tsa_ref_len\tsa_query_start\tsa_query_len"
+       "\tstrands\tjunction\tcount\tdq_median\tdegenerate\twinner\n";
+  for (const string &b : vote_dump)
+    f << b;
+  f.close();
+}
+
 vector<Clip> Clipper::filter_tooclose_clips(
     const vector<Clip> &clips,
     unordered_map<string, interval_tree_t<int>> &vartrees,
@@ -675,7 +774,7 @@ void Clipper::call(int threads,
       spdlog::info("[CLIP_FILTER][RIGHT] after filter_lowcovered(1): {}", rclips.size());
       rclips = filter_tooclose_clips(rclips, vartrees, calltrees);
       spdlog::info("[CLIP_FILTER][RIGHT] after filter_tooclose_clips: {}", rclips.size());
-      rclips = cluster(rclips, 1000);
+      rclips = cluster(rclips, 1000, "R");
       spdlog::info("[CLIP_FILTER][RIGHT] after cluster(1000): {}", rclips.size());
       sort(rclips.begin(), rclips.end());
     } else {
@@ -687,7 +786,7 @@ void Clipper::call(int threads,
       spdlog::info("[CLIP_FILTER][LEFT] after filter_lowcovered(1): {}", lclips.size());
       lclips = filter_tooclose_clips(lclips, vartrees, calltrees);
       spdlog::info("[CLIP_FILTER][LEFT] after filter_tooclose_clips: {}", lclips.size());
-      lclips = cluster(lclips, 1000);
+      lclips = cluster(lclips, 1000, "L");
       spdlog::info("[CLIP_FILTER][LEFT] after cluster(1000): {}", lclips.size());
       sort(lclips.begin(), lclips.end());
     }
@@ -722,6 +821,7 @@ void Clipper::call(int threads,
     spdlog::info("Storing clip clusters to {}",
                  Configuration::getInstance()->clip_clusters);
     store_clip_clusters(lclips, rclips);
+    store_vote_groups();
   }
   _p_svs.resize(threads);
   // Aggregate clip-cluster statistics (info-level summary at the end).
@@ -986,8 +1086,6 @@ void Clipper::call(int threads,
                         max(lclip_pool[i],
                             max(linv_pool[i],
                                 max(ldel_pool[i], lbnd_pool[i]))));
-       if (eff_w < Configuration::getInstance()->min_cluster_weight)
-         continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); lc.p is 0-based (htslib) → convert
        uint sa_pos0 = lc.sa_pos > 0 ? lc.sa_pos - 1 : 0;
@@ -1002,6 +1100,31 @@ void Clipper::call(int threads,
        bool opp_strand = (lc.primary_reverse != lc.sa_reverse);
        bool as_bnd = (lc.sa_chrom != chrom) ||
                      (min_bnd_dist > 0 && opp_strand && intra_dist >= min_bnd_dist);
+       // A cross-chromosomal breakend below the gate is not necessarily short of
+       // evidence: reads that reach this locus as a hard-clipped SUPPLEMENTARY
+       // never became a Clip, so eff_w undercounts the junction. Hand the cluster
+       // to Caller, which has the BAM and can count them on the partner locus
+       // (see ClipBndCand). This has to happen BEFORE the continue below, which is
+       // where such a cluster used to die unrecorded.
+       if (eff_w < Configuration::getInstance()->min_cluster_weight) {
+         if (as_bnd && eff_w >= CLIP_BND_RESCUE_MIN_W &&
+      lc.sa_names.size() * CLIP_BND_RESCUE_MIN_SA_FRAC_INV >= lc.w) {
+           ClipBndCand bc;
+           bc.chrom = chrom;
+           bc.p = lc.p;
+           bc.refbase = string(chromosome_seqs[chrom] + lc.p, 1);
+           bc.alt = bnd_alt(lc, true, bc.refbase);
+           bc.sa_chrom = lc.sa_chrom;
+           bc.sa_pos = lc.sa_pos;
+           bc.sa_ref_len = lc.sa_ref_len;
+           bc.clip_w = eff_w;
+           bc.names = lc.names;
+           bc.sa_names = lc.sa_names;
+#pragma omp critical(prov_bnds)
+           prov_bnds.push_back(bc);
+         }
+         continue;
+       }
        if (as_bnd) {
            // BND: cross-chrom or long-range intra-chrom translocation.
            // Consume clip regardless of weight.
@@ -1010,18 +1133,10 @@ void Clipper::call(int threads,
            // is only the half of the junction's reads whose primary landed on
            // this breakend (see the reciprocal BND pooling above).
            uint bnd_w = max(lc.w, lbnd_pool[i]);
-           if (bnd_w >= Configuration::getInstance()->min_cluster_weight) {
-               string refbase(chromosome_seqs[chrom] + lc.p, 1);
-               // Mate junction position on the partner chromosome. For a left
-               // clip the SA end adjacent to the junction is sa_pos+sa_ref_len
-               // when both map on the same strand, otherwise sa_pos (1-based).
-               bool same_strand = (lc.primary_reverse == lc.sa_reverse);
-               uint mate = same_strand ? (lc.sa_pos + lc.sa_ref_len) : lc.sa_pos;
-               // Left clip: primary lies to the RIGHT of the breakend, so the
-               // mate piece precedes refbase. ']' keeps the mate forward (same
-               // strand), '[' takes it reverse-complemented (opposite strand).
-               string br = same_strand ? "]" : "[";
-               string alt = br + lc.sa_chrom + ":" + to_string(mate) + br + refbase;
+           const uint bnd_gate = Configuration::getInstance()->min_cluster_weight;
+           string refbase(chromosome_seqs[chrom] + lc.p, 1);
+           string alt = bnd_alt(lc, true, refbase);
+           if (bnd_w >= bnd_gate) {
                SV sv = SV("BND", chrom, lc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
                sv.add_reads(lc.names);
                sv.add_sa_reads(lc.sa_names);
@@ -1192,8 +1307,6 @@ void Clipper::call(int threads,
                         max(rclip_pool[i],
                             max(rinv_pool[i],
                                 max(rdel_pool[i], rbnd_pool[i]))));
-       if (eff_w < Configuration::getInstance()->min_cluster_weight)
-         continue;
        uint min_sv_len = Configuration::getInstance()->min_sv_length;
        // sa_pos is 1-based (SAM spec); rc.p is 0-based (htslib) → convert
        uint sa_pos0 = rc.sa_pos > 0 ? rc.sa_pos - 1 : 0;
@@ -1208,24 +1321,41 @@ void Clipper::call(int threads,
        bool opp_strand = (rc.primary_reverse != rc.sa_reverse);
        bool as_bnd = (rc.sa_chrom != chrom) ||
                      (min_bnd_dist > 0 && opp_strand && intra_dist >= min_bnd_dist);
+       // A cross-chromosomal breakend below the gate is not necessarily short of
+       // evidence: reads that reach this locus as a hard-clipped SUPPLEMENTARY
+       // never became a Clip, so eff_w undercounts the junction. Hand the cluster
+       // to Caller, which has the BAM and can count them on the partner locus
+       // (see ClipBndCand). This has to happen BEFORE the continue below, which is
+       // where such a cluster used to die unrecorded.
+       if (eff_w < Configuration::getInstance()->min_cluster_weight) {
+         if (as_bnd && eff_w >= CLIP_BND_RESCUE_MIN_W &&
+      rc.sa_names.size() * CLIP_BND_RESCUE_MIN_SA_FRAC_INV >= rc.w) {
+           ClipBndCand bc;
+           bc.chrom = chrom;
+           bc.p = rc.p;
+           bc.refbase = string(chromosome_seqs[chrom] + rc.p, 1);
+           bc.alt = bnd_alt(rc, false, bc.refbase);
+           bc.sa_chrom = rc.sa_chrom;
+           bc.sa_pos = rc.sa_pos;
+           bc.sa_ref_len = rc.sa_ref_len;
+           bc.clip_w = eff_w;
+           bc.names = rc.names;
+           bc.sa_names = rc.sa_names;
+#pragma omp critical(prov_bnds)
+           prov_bnds.push_back(bc);
+         }
+         continue;
+       }
        if (as_bnd) {
            // BND: cross-chrom or long-range intra-chrom translocation.
            // Consume clip regardless of weight.
            sa_used = true;
            // Gate on the pooled weight (see the left-clip loop).
            uint bnd_w = max(rc.w, rbnd_pool[i]);
-           if (bnd_w >= Configuration::getInstance()->min_cluster_weight) {
-               string refbase(chromosome_seqs[chrom] + rc.p, 1);
-               // Mate junction position: symmetrical to the left-clip case. For
-               // a right clip the adjacent SA end is sa_pos when both map on the
-               // same strand, otherwise sa_pos+sa_ref_len (1-based).
-               bool same_strand = (rc.primary_reverse == rc.sa_reverse);
-               uint mate = same_strand ? rc.sa_pos : (rc.sa_pos + rc.sa_ref_len);
-               // Right clip: primary lies to the LEFT of the breakend, so the
-               // mate piece follows refbase. '[' keeps the mate forward (same
-               // strand), ']' takes it reverse-complemented (opposite strand).
-               string br = same_strand ? "[" : "]";
-               string alt = refbase + br + rc.sa_chrom + ":" + to_string(mate) + br;
+           const uint bnd_gate = Configuration::getInstance()->min_cluster_weight;
+           string refbase(chromosome_seqs[chrom] + rc.p, 1);
+           string alt = bnd_alt(rc, false, refbase);
+           if (bnd_w >= bnd_gate) {
                SV sv = SV("BND", chrom, rc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
                sv.add_reads(rc.names);
                sv.add_sa_reads(rc.sa_names);

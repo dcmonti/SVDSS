@@ -50,6 +50,73 @@ uint Caller::count_through_del_reads(samFile *bam, hts_idx_t *idx,
   return count;
 }
 
+// Tolerance, in bp, when matching an SA entry back to the candidate breakend.
+// The clip cluster key and an SA start differ by the usual aligner jitter plus
+// whatever the cluster radius folded in; 500 is well inside the distance to any
+// unrelated junction and was checked against the COLO829 truthset_53 locus.
+static const int PARTNER_SA_TOL = 500;
+// Padding around the partner segment when fetching reads: a supplementary that
+// covers the fragment may start slightly before it.
+static const int PARTNER_PAD = 300;
+
+uint Caller::count_partner_sa_reads(samFile *bam, hts_idx_t *idx,
+                                    bam_hdr_t *hdr, const string &sa_chrom,
+                                    uint sa_pos, uint sa_ref_len,
+                                    const string &back_chrom, uint back_pos,
+                                    const unordered_set<string> &exclude) {
+  int tid = bam_name2id(hdr, sa_chrom.c_str());
+  if (tid < 0)
+    return 0;
+  const int beg = (int)sa_pos > PARTNER_PAD ? (int)sa_pos - PARTNER_PAD : 0;
+  const int end = (int)sa_pos + (int)sa_ref_len + PARTNER_PAD;
+  hts_itr_t *it = sam_itr_queryi(idx, tid, beg, end);
+  if (!it)
+    return 0;
+  bam1_t *aln = bam_init1();
+  // Dedup by name: one read can have several records over the partner segment
+  // (primary plus supplementaries) and must count once.
+  unordered_set<string> seen;
+  while (sam_itr_next(bam, it, aln) >= 0) {
+    if (aln->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP))
+      continue;
+    // SUPPLEMENTARY is deliberately NOT skipped: those are exactly the records
+    // this rescue exists to find.
+    if (aln->core.qual < config->min_mapq)
+      continue;
+    const char *qname = bam_get_qname(aln);
+    if (exclude.count(qname) || seen.count(qname))
+      continue;
+    uint8_t *sa = bam_aux_get(aln, "SA");
+    if (!sa)
+      continue;
+    const char *sz = bam_aux2Z(sa);
+    if (!sz)
+      continue;
+    // SA:Z: is rname,pos,strand,CIGAR,mapQ,NM; ... — only rname and pos matter.
+    bool hit = false;
+    const char *q = sz;
+    while (*q && !hit) {
+      const char *comma = strchr(q, ',');
+      if (!comma)
+        break;
+      const string rname(q, comma - q);
+      const long pos = atol(comma + 1);
+      if (rname == back_chrom && labs(pos - (long)back_pos) <= PARTNER_SA_TOL)
+        hit = true;
+      const char *semi = strchr(comma, ';');
+      if (!semi)
+        break;
+      q = semi + 1;
+    }
+    if (hit)
+      seen.insert(qname);
+  }
+  uint count = (uint)seen.size();
+  bam_destroy1(aln);
+  hts_itr_destroy(it);
+  return count;
+}
+
 void Caller::run() {
   config = Configuration::getInstance();
 
@@ -218,6 +285,64 @@ void Caller::run() {
         spdlog::warn(
             "[CLIP_MODEB] could not open tumour BAM {}; skipping rescue",
             config->bam);
+      }
+      if (hdr) bam_hdr_destroy(hdr);
+      if (idx) hts_idx_destroy(idx);
+      if (bam) hts_close(bam);
+    }
+
+    // Sub-threshold BND rescue. A breakend whose clip weight misses the gate can
+    // still be crossed by reads that reach the locus as a HARD-CLIPPED
+    // SUPPLEMENTARY: those never become a Clip, so the clip weight
+    // systematically undercounts the junction. They are visible on the PARTNER
+    // locus, where the same reads carry an SA pointing back here, so that is
+    // where we count them. Read-disjoint from the cluster by construction
+    // (`exclude`), so the sum is honest evidence and not a relaxed threshold.
+    //
+    // This is the only way to reach this class of event: a short inserted
+    // fragment is always a supplementary and never a primary with soft clips, so
+    // it yields no clip cluster for the reciprocal BND pooling to pool with.
+    if (!clipper.prov_bnds.empty() && !config->bam.empty()) {
+      samFile *bam = hts_open(config->bam.c_str(), "r");
+      hts_idx_t *idx = bam ? sam_index_load(bam, config->bam.c_str()) : nullptr;
+      bam_hdr_t *hdr = bam ? sam_hdr_read(bam) : nullptr;
+      if (bam && idx && hdr) {
+        uint rescued = 0, germline = 0;
+        for (const ClipBndCand &bc : clipper.prov_bnds) {
+          unordered_set<string> excl(bc.sa_names.begin(), bc.sa_names.end());
+          uint n_sup = count_partner_sa_reads(bam, idx, hdr, bc.sa_chrom,
+                                              bc.sa_pos, bc.sa_ref_len,
+                                              bc.chrom, bc.p, excl);
+          if (bc.clip_w + n_sup < config->min_cluster_weight)
+            continue;
+          // Germline veto, as in Mode B: the same junction supported in the
+          // normal is germline. Counted the same way, on the normal's handles.
+          if (_p_normal_bam &&
+              count_partner_sa_reads(_p_normal_bam[0], _p_normal_idx[0],
+                                     _p_normal_hdr[0], bc.sa_chrom, bc.sa_pos,
+                                     bc.sa_ref_len, bc.chrom, bc.p, excl) >=
+                  (uint)config->germline_min_reads) {
+            ++germline;
+            spdlog::debug("[CLIP_BNDRESCUE][GERMLINE] {}:{} -> {}:{} skipped",
+                          bc.chrom, bc.p, bc.sa_chrom, bc.sa_pos);
+            continue;
+          }
+          SV sv("BND", bc.chrom, bc.p, bc.refbase, bc.alt,
+                bc.clip_w + n_sup, 0, 0, 0, true, 0);
+          sv.add_reads(bc.names);
+          sv.add_sa_reads(bc.sa_names);
+          clipped_svs.push_back(sv);
+          ++rescued;
+          spdlog::debug("[CLIP_BNDRESCUE] {}:{} -> {}:{} clip_w={} supp={} -> w={}",
+                        bc.chrom, bc.p, bc.sa_chrom, bc.sa_pos, bc.clip_w,
+                        n_sup, bc.clip_w + n_sup);
+        }
+        spdlog::info("[CLIP_BNDRESCUE] {}/{} sub-threshold clipped BNDs rescued "
+                     "({} vetoed as germline)",
+                     rescued, clipper.prov_bnds.size(), germline);
+      } else {
+        spdlog::warn("[CLIP_BNDRESCUE] could not open tumour BAM {}; skipping",
+                     config->bam);
       }
       if (hdr) bam_hdr_destroy(hdr);
       if (idx) hts_idx_destroy(idx);

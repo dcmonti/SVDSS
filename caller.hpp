@@ -119,6 +119,16 @@ private:
   // read-disjoint from the split (clipped) reads (Mode B clip rescue).
   uint count_through_del_reads(samFile *bam, hts_idx_t *idx, bam_hdr_t *hdr,
                                const string &chrom, uint s, uint len);
+  // Reads that cross the junction (chrom:p <-> sa_chrom:sa_pos) but reach
+  // chrom:p as a hard-clipped SUPPLEMENTARY alignment, so they never produced a
+  // Clip and are missing from the clip weight. Counted on the PARTNER locus,
+  // where they do appear, by reading their SA tag back. `exclude` holds the read
+  // names already in the cluster, so nothing is counted twice.
+  uint count_partner_sa_reads(samFile *bam, hts_idx_t *idx, bam_hdr_t *hdr,
+                              const string &sa_chrom, uint sa_pos,
+                              uint sa_ref_len, const string &back_chrom,
+                              uint back_pos,
+                              const unordered_set<string> &exclude);
 
   // parallelize
   vector<vector<SV>> _p_svs;
