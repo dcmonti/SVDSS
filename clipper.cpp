@@ -165,9 +165,20 @@ static bool sa_vote_winner(const vector<SAGroup> &groups,
   const uint min_len = Configuration::getInstance()->min_sv_length;
   auto degenerate = [&](const SAGroup &g) {
     if (g.sa_chrom != clip_chrom)
-      return false;
-    long long d = (long long)g.junction - (long long)clip_pos;
-    return (d < 0 ? -d : d) < (long long)min_len;
+      return false; // cross-contig: the junction is elsewhere, never degenerate
+    long long dR = (long long)g.junction - (long long)clip_pos;
+    if (dR < 0)
+      dR = -dR;
+    // Same predicate the emission branches use, so the vote and the call agree
+    // by construction. A reference gap below min_sv_length does not make a
+    // group useless: an insertion has no reference gap at all and takes its
+    // length from the QUERY gap, so a group is degenerate only when it can
+    // yield neither a deletion nor an insertion.
+    const long long dQ = median_int(g.dqs);
+    const long long m = (long long)min_len;
+    const bool viable_del = dR > dQ + m;
+    const bool viable_ins = dQ > dR + m;
+    return !(viable_del || viable_ins);
   };
   int best = -1;
   for (uint i = 0; i < groups.size(); ++i) {
