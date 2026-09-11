@@ -595,6 +595,10 @@ void Clipper::store_clip_clusters(const vector<Clip> &lclips,
     if (c.sa_chrom != c.chrom ||
         (dump_min_bnd > 0 && dump_opp && dump_dist >= dump_min_bnd)) {
       branch = "BND";
+      // dQ was left "." on the BND branch, hiding the one number that says
+      // whether a junction is flush or skips a templated fragment. The vote
+      // dump carried it, this file did not; now both do.
+      dQ_s = std::to_string(c.dq);
     } else if (c.primary_reverse != c.sa_reverse) {
       branch = "INV";
       uint sa_pos0 = c.sa_pos > 0 ? c.sa_pos - 1 : 0;
@@ -1118,6 +1122,8 @@ void Clipper::call(int threads,
            bc.sa_pos = lc.sa_pos;
            bc.sa_ref_len = lc.sa_ref_len;
            bc.clip_w = eff_w;
+           bc.dq = lc.dq;
+           bc.ins_seq = lc.ins_seq;
            bc.names = lc.names;
            bc.sa_names = lc.sa_names;
 #pragma omp critical(prov_bnds)
@@ -1138,6 +1144,12 @@ void Clipper::call(int threads,
            string alt = bnd_alt(lc, true, refbase);
            if (bnd_w >= bnd_gate) {
                SV sv = SV("BND", chrom, lc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
+               // The junction detail was previously dropped for BND: dq lived in the
+               // Clip and never reached the record, so a composite junction -- one
+               // that skips a short templated fragment -- was indistinguishable from
+               // a flush one. SVINSSEQ is what makes that fragment recoverable.
+               annotate_junction(sv, lc.dq, lc.ins_seq,
+                                 chromosome_seqs[chrom] + lc.p);
                sv.add_reads(lc.names);
                sv.add_sa_reads(lc.sa_names);
                _p_svs[t].push_back(sv);
@@ -1339,6 +1351,8 @@ void Clipper::call(int threads,
            bc.sa_pos = rc.sa_pos;
            bc.sa_ref_len = rc.sa_ref_len;
            bc.clip_w = eff_w;
+           bc.dq = rc.dq;
+           bc.ins_seq = rc.ins_seq;
            bc.names = rc.names;
            bc.sa_names = rc.sa_names;
 #pragma omp critical(prov_bnds)
@@ -1357,6 +1371,12 @@ void Clipper::call(int threads,
            string alt = bnd_alt(rc, false, refbase);
            if (bnd_w >= bnd_gate) {
                SV sv = SV("BND", chrom, rc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
+               // The junction detail was previously dropped for BND: dq lived in the
+               // Clip and never reached the record, so a composite junction -- one
+               // that skips a short templated fragment -- was indistinguishable from
+               // a flush one. SVINSSEQ is what makes that fragment recoverable.
+               annotate_junction(sv, rc.dq, rc.ins_seq,
+                                 chromosome_seqs[chrom] + rc.p);
                sv.add_reads(rc.names);
                sv.add_sa_reads(rc.sa_names);
                _p_svs[t].push_back(sv);

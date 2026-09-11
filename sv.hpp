@@ -49,6 +49,13 @@ struct CallStats {
   int n_conc = -1;    // reads carrying a concordant indel (germline support)
   int nhp1 = -1, nhp2 = -1, nhp0 = -1; // spanning normal reads per haplotype
   vector<int> n_lens; // same-type indel lengths seen in the normal window
+  // Spanning normal reads carrying a same-type indel >= min_sv_length ANYWHERE
+  // in the (wider) window, with NO length comparison against this call. It is
+  // the count behind gate C: n_poly/n_exam answers "is this locus
+  // length-polymorphic in the normal", a different question from gate A's "does
+  // the normal carry THIS allele". At a VNTR the two diverge -- the normal holds
+  // the locus at a different length, so gate A sees nothing.
+  int n_poly = -1;
 };
 
 class SV {

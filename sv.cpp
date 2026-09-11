@@ -132,7 +132,7 @@ ostream &operator<<(ostream &os, const SV &sv) {
      << ";ALENMAX=" << sv.stats.alen_max << ";";
   if (sv.stats.n_exam >= 0) {
     os << "NEXAM=" << sv.stats.n_exam << ";NLOWQ=" << sv.stats.n_lowq
-       << ";NCONC=" << sv.stats.n_conc << ";"
+       << ";NCONC=" << sv.stats.n_conc << ";NPOLY=" << sv.stats.n_poly << ";"
        << "NHP1=" << sv.stats.nhp1 << ";NHP2=" << sv.stats.nhp2 << ";NHP0="
        << sv.stats.nhp0 << ";";
     // Raw lengths, not a summary: the whole point is to be able to re-test

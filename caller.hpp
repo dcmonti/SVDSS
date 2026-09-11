@@ -124,6 +124,23 @@ private:
   // Clip and are missing from the clip weight. Counted on the PARTNER locus,
   // where they do appear, by reading their SA tag back. `exclude` holds the read
   // names already in the cluster, so nothing is counted twice.
+  // A candidate templated fragment: a locus on ANOTHER contig that reads at a
+  // called deletion's breakpoints reach through their SA tag. `block` is the
+  // reference span the SA CIGAR matches, i.e. the fragment length, and the
+  // fragment occupies [pos, pos+block). See doc/templated_insertions.md.
+  struct SAFragment {
+    string chrom;
+    uint pos;
+    uint block;
+    uint nreads;
+    bool reverse;
+  };
+  // Cross-contig SA groups seen within `pad` of either breakpoint of the
+  // deletion chrom:[s,e]. Grouped by (contig, pos within tol, strand) and
+  // counted by distinct read name.
+  vector<SAFragment> collect_sa_fragments(samFile *bam, hts_idx_t *idx,
+                                          bam_hdr_t *hdr, const string &chrom,
+                                          uint s, uint e);
   uint count_partner_sa_reads(samFile *bam, hts_idx_t *idx, bam_hdr_t *hdr,
                               const string &sa_chrom, uint sa_pos,
                               uint sa_ref_len, const string &back_chrom,

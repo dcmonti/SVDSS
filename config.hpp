@@ -177,6 +177,67 @@ public:
   bool gates = true;
   int gate_min_reads = 2;
   float gate_tol_frac = 0.25;
+  // gate_win: half-window, in bp, over which gate A looks for normal reads
+  //   carrying a same-type indel of MATCHING length (it also sets the fetch
+  //   region and the alen_med search). Was hardcoded at 150 in
+  //   collect_call_stats; measured too tight on both samples. On COLO829 the
+  //   germline evidence sits 152, 185 and 368 bp from the breakpoint, and at
+  //   chr11:10249845 82 of 84 spanning normal reads carry the allele while the
+  //   gate at 150 saw none -- missed by 2 bp. Widening to 500 marked 5 more
+  //   COLO829 records and 4 more HG008 records GERMLINE, ALL of them false
+  //   positives, and cost 0 true positives on either sample.
+  //   Deliberately a SEPARATE knob from gate_poly_win below: the two gates ask
+  //   different questions and must be tunable apart, even though both currently
+  //   sit at 500. The fetch region uses max(gate_win, gate_poly_win).
+  int gate_win = 500;
+  // ---- gate C: locus length-polymorphic in the normal ----------------------
+  // Gate A asks whether the normal carries THIS allele, so it compares lengths.
+  // At a length-polymorphic locus that test cannot fire: the normal allele
+  // differs in length by definition. Gate C drops the length comparison and asks
+  // instead what FRACTION of spanning normal reads carries a same-type indel at
+  // all -- "is this locus polymorphic in the normal", which is the question that
+  // actually decides whether a tumour call of some other length is somatic.
+  //
+  // gate_poly_win: half-window, in bp, for collecting those indels. Unlike
+  //   gate_win this window is CENTRED ON THE BREAKPOINT and does not span the
+  //   event: with the spanning window, truthset_22 -- a 32.5 kb COLO829
+  //   deletion -- was flagged POLYNORMAL because within 32 kb the normal has
+  //   unrelated germline indels (23 reads of 64), costing a true positive.
+  // gate_poly_frac: fraction above which the locus is called polymorphic.
+  //   0.40, not 0.25, and the reason matters. Calibrating against truvari labels
+  //   alone put the plateau at 0.15-0.30, but those labels call two HG008
+  //   records false that manual screening keeps: INS chr15:74894107 (0.333, a
+  //   174 bp expansion of a ~90 bp germline allele) and INS chr4:30278703
+  //   (0.364, a 28 bp-motif VNTR contraction). Both are in the curated
+  //   keep-list, so the GT and the intended behaviour disagree exactly there.
+  //   There is a clean gap: those two sit at 0.333 and 0.364, while every
+  //   COLO829 false positive sits at 0.4375, 0.4545 and 1.00. Any threshold in
+  //   (0.364, 0.4375] keeps both and still catches all three; 0.40 is near the
+  //   middle of that window.
+  //   Measured at 0.40 on TWO samples. COLO829: all 3 POLYNORMAL still caught,
+  //   F1 unchanged. HG008: 9 of the FP caught, and the one true positive given
+  //   up is chr1:224013772 (0.565, a 2490 bp insertion where 13 of 23 normal
+  //   reads already carry one -- no threshold saves it without giving up most
+  //   of the FP). RE-MEASURE on a third sample.
+  // gate_poly_min_reads: absolute floor. A fraction over 4 reads is noise: some
+  //   HG008 loci gave 2/4 = 0.50. Higher than gate_min_reads on purpose, because
+  //   gate A's length-matched test is far more specific than this one.
+  int gate_poly_win = 500;
+  float gate_poly_frac = 0.40;
+  int gate_poly_min_reads = 3;
+  // ---- gate D: mismapping sink --------------------------------------------
+  // Gate C is blind by dilution where the denominator is absurd: at
+  // chr16:46391338 the normal has 25568 spanning reads of which 263 carry the
+  // indel, a fraction of 0.01 -- yet 263 reads of germline evidence is a
+  // mountain. True positives on COLO829 span 16-98 normal reads, so 25568 is
+  // ~300x the norm: not a locus, a satellite mismapping sink.
+  //
+  // Self-normalising on purpose: the MEDIAN of n_exam over the records of the
+  // run estimates this sample's normal depth, so there is no extra BAM pass and
+  // no external annotation, and it follows the coverage. Between 98 and 23910
+  // any factor from 2 to 200 separates, so 10 is deliberately loose. It reads
+  // the NORMAL's depth, so tumour copy-number gain cannot trigger it.
+  int gate_depth_factor = 10;
   float gate_q = 0.85;   // P(a normal read of the right haplotype shows a het)
   float gate_conf = 0.95;
   bool germline_realign = true;

@@ -55,9 +55,128 @@ uint Caller::count_through_del_reads(samFile *bam, hts_idx_t *idx,
 // whatever the cluster radius folded in; 500 is well inside the distance to any
 // unrelated junction and was checked against the COLO829 truthset_53 locus.
 static const int PARTNER_SA_TOL = 500;
+// Templated-insertion reclassification (see the block in Caller::run).
+// MIN_DEL_LEN: below this a "deletion" is too short for the replaced-segment
+//   reasoning to mean anything.
+// MIN_READS: on COLO829 the true fragment is carried by 2 reads out of 136, and
+//   of the 30 emitted deletions exactly ONE has any unexplained cross-contig
+//   group at all -- all 27 true positives have none. The population is that
+//   clean, which is why 2 is defensible here; it must be re-measured before
+//   trusting it on another sample.
+// MAX_FRAG_RATIO: the fragment must be at least this many times shorter than
+//   the deletion it sits in.
+static const uint TEMPL_MIN_DEL_LEN = 200;
+static const uint TEMPL_MIN_READS = 2;
+static const uint TEMPL_MAX_FRAG_RATIO = 4;
 // Padding around the partner segment when fetching reads: a supplementary that
 // covers the fragment may start slightly before it.
 static const int PARTNER_PAD = 300;
+
+// Reference span an SA CIGAR matches: the fragment length. Only M/D/N consume
+// reference; S/H/I do not.
+static uint sa_cigar_ref_span(const char *cig, const char *end) {
+  uint span = 0, num = 0;
+  for (const char *q = cig; q < end && *q; ++q) {
+    if (*q >= '0' && *q <= '9') {
+      num = num * 10 + (uint)(*q - '0');
+    } else {
+      if (*q == 'M' || *q == 'D' || *q == 'N' || *q == '=' || *q == 'X')
+        span += num;
+      num = 0;
+    }
+  }
+  return span;
+}
+
+// Cross-contig SA groups at a called deletion's breakpoints. Both breakpoints
+// are scanned because the two ends of a templated fragment attach one to each,
+// and a read crossing either junction reports the same SA segment.
+//
+// Tolerance is deliberately tight (PARTNER_SA_TOL/5): two DISTINCT templated
+// insertions a few kb apart are a real configuration on COLO829
+// (truthset_19/20 and truthset_52/53 sit 5-30 kb apart), and a long read
+// crossing both reports both fragments. Grouping them together would merge two
+// separate events.
+vector<Caller::SAFragment>
+Caller::collect_sa_fragments(samFile *bam, hts_idx_t *idx, bam_hdr_t *hdr,
+                             const string &chrom, uint s, uint e) {
+  vector<SAFragment> out;
+  int tid = bam_name2id(hdr, chrom.c_str());
+  if (tid < 0)
+    return out;
+  const int tol = PARTNER_SA_TOL / 5;
+  // (contig, bucketed pos, strand) -> distinct read names, and the modal block
+  // key -> (nomi read distinti, (lunghezza blocco, posizione REALE))
+  map<tuple<string, uint, bool>, pair<set<string>, pair<uint, uint>>> groups;
+  bam1_t *aln = bam_init1();
+  const uint bp[2] = {s, e};
+  for (int side = 0; side < 2; ++side) {
+    const int beg = (int)bp[side] > PARTNER_PAD ? (int)bp[side] - PARTNER_PAD : 0;
+    hts_itr_t *it =
+        sam_itr_queryi(idx, tid, beg, (int)bp[side] + PARTNER_PAD);
+    if (!it)
+      continue;
+    while (sam_itr_next(bam, it, aln) >= 0) {
+      if (aln->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP))
+        continue;
+      if (aln->core.qual < config->min_mapq)
+        continue;
+      uint8_t *sa = bam_aux_get(aln, "SA");
+      if (!sa)
+        continue;
+      const char *sz = bam_aux2Z(sa);
+      if (!sz)
+        continue;
+      const char *qname = bam_get_qname(aln);
+      const char *q = sz;
+      while (*q) {
+        // rname,pos,strand,CIGAR,mapQ,NM;
+        const char *c1 = strchr(q, ',');
+        if (!c1)
+          break;
+        const string rname(q, c1 - q);
+        const char *c2 = strchr(c1 + 1, ',');
+        if (!c2)
+          break;
+        const long pos = atol(c1 + 1);
+        const char *c3 = strchr(c2 + 1, ',');
+        if (!c3)
+          break;
+        const bool rev = (*(c2 + 1) == '-');
+        const char *c4 = strchr(c3 + 1, ',');
+        const char *semi = strchr(c3 + 1, ';');
+        if (!c4 || !semi)
+          break;
+        if (rname != chrom && pos > 0) {
+          const uint span = sa_cigar_ref_span(c3 + 1, c4);
+          // Il bucket serve SOLO a raggruppare: la posizione riportata deve
+          // essere quella reale, altrimenti il mate esce spostato di meta'
+          // bucket e la geometria emessa non e' quella dei read.
+          auto key = make_tuple(rname, (uint)(pos / tol) * (uint)tol, rev);
+          auto &g = groups[key];
+          g.first.insert(qname);
+          if (g.second.first == 0) {
+            g.second.first = span;
+            g.second.second = (uint)pos;
+          }
+        }
+        q = semi + 1;
+      }
+    }
+    hts_itr_destroy(it);
+  }
+  bam_destroy1(aln);
+  for (const auto &kv : groups) {
+    SAFragment f;
+    f.chrom = get<0>(kv.first);
+    f.reverse = get<2>(kv.first);
+    f.block = kv.second.second.first;
+    f.pos = kv.second.second.second;
+    f.nreads = (uint)kv.second.first.size();
+    out.push_back(f);
+  }
+  return out;
+}
 
 uint Caller::count_partner_sa_reads(samFile *bam, hts_idx_t *idx,
                                     bam_hdr_t *hdr, const string &sa_chrom,
@@ -186,10 +305,19 @@ void Caller::run() {
   // Needs the sort (it walks neighbours) and must precede the stats, so that a
   // merged record is measured over its full span.
   merge_fragmented_dels(svs);
-  spdlog::info("Writing {} SVs.", svs.size());
-  collect_call_stats(svs);
-  apply_gates(svs);
-  write_vcf();
+  // The POA output is DEFERRED to after the clipped section when --clipped is on.
+  // Reason: the templated-insertion reclassification has to remove a POA
+  // deletion from the output, and the guard that makes it safe needs the clipped
+  // breakends (the fragment to ignore is the one already explained by one). The
+  // two call sets are appended to stdout in two phases, so once write_vcf() has
+  // run the deletion is out and cannot be recalled. Order of the output is
+  // unchanged: POA records still precede the clipped ones.
+  if (!config->clipped) {
+    spdlog::info("Writing {} SVs.", svs.size());
+    collect_call_stats(svs);
+    apply_gates(svs);
+    write_vcf();
+  }
 
   if (config->poa.compare("") != 0) {
     spdlog::info("Writing POA alignments to {}..", config->poa);
@@ -329,6 +457,15 @@ void Caller::run() {
           }
           SV sv("BND", bc.chrom, bc.p, bc.refbase, bc.alt,
                 bc.clip_w + n_sup, 0, 0, 0, true, 0);
+          // Same junction detail a directly emitted BND now carries. Done here
+          // rather than in Clipper because the SV only exists once the rescue
+          // has decided the weight.
+          if (bc.dq > 0) {
+            sv.ins_len = bc.dq;
+            sv.ins_seq = bc.ins_seq;
+          } else if (bc.dq < 0) {
+            sv.hom_len = -bc.dq;
+          }
           sv.add_reads(bc.names);
           sv.add_sa_reads(bc.sa_names);
           clipped_svs.push_back(sv);
@@ -394,6 +531,169 @@ void Caller::run() {
         kept.push_back(sv);
       }
     }
+    // ---- Templated-insertion reclassification -------------------------------
+    // A short fragment copied from a third locus and spliced into a junction is
+    // reported by the POA path as a plain DELETION of the replaced segment: the
+    // fragment is too short to survive into the consensus, so what is left is the
+    // loss of the host sequence. COLO829 truthset_19/20 is the case -- 122 bp of
+    // chr6 in place of 4549 bp of chr15, called as DEL chr15:23467472 len 4545.
+    //
+    // The reads know better: a handful of them split across the fragment and
+    // carry it as an SA. One SA segment is enough, because the fragment's two
+    // ENDS are the two breakends of the event.
+    //
+    // THE HARD PART IS NOT FINDING A FRAGMENT, IT IS PICKING THE RIGHT ONE.
+    // At the truthset_19/20 deletion the strongest cross-contig group is NOT the
+    // right one: chr20:38645824 (201 bp) shows up from both breakpoints with more
+    // reads than chr6:138452922 (124 bp), because 20 kb reads crossing the
+    // NEIGHBOURING templated insertion (truthset_52/53, 5-30 kb away) reach into
+    // these windows. Both fragments are real; only one belongs to this deletion.
+    // Counting cannot separate them. What separates them is that the chr20
+    // fragment is ALREADY ACCOUNTED FOR by two emitted breakends, and the chr6
+    // one by nothing: evidence that already has an owner must not be
+    // re-attributed.
+    if (!config->bam.empty()) {
+      samFile *bam = hts_open(config->bam.c_str(), "r");
+      hts_idx_t *idx = bam ? sam_index_load(bam, config->bam.c_str()) : nullptr;
+      bam_hdr_t *hdr = bam ? sam_hdr_read(bam) : nullptr;
+      if (bam && idx && hdr) {
+        // Loci already explained: every mate anchor of a breakend that will
+        // actually be EMITTED. `kept` and not `clipped_svs`: a breakend dropped
+        // as germline or lost to the reciprocal-overlap dedup does not own
+        // anything, because it is not part of the answer.
+        vector<pair<string, long>> owned;
+        for (const SV &sv : kept) {
+          if (sv.type != "BND")
+            continue;
+          size_t a = sv.altall.find_first_of("[]");
+          if (a == string::npos)
+            continue;
+          size_t colon = sv.altall.find(':', a);
+          size_t b = sv.altall.find_first_of("[]", a + 1);
+          if (colon == string::npos || b == string::npos || colon > b)
+            continue;
+          owned.push_back({sv.altall.substr(a + 1, colon - a - 1),
+                           atol(sv.altall.c_str() + colon + 1)});
+        }
+        uint recl = 0, ambiguous = 0;
+        vector<bool> drop(svs.size(), false);
+        vector<SV> split_svs;
+        for (size_t i = 0; i < svs.size(); ++i) {
+          const SV &sv = svs[i];
+          if (sv.type != "DEL")
+            continue;
+          const uint dlen = (uint)abs(sv.l);
+          if (dlen < TEMPL_MIN_DEL_LEN)
+            continue;
+          vector<SAFragment> fr = collect_sa_fragments(
+              bam, idx, hdr, sv.chrom, (uint)sv.s, (uint)sv.e);
+          vector<SAFragment> keep;
+          for (const SAFragment &f : fr) {
+            if (f.nreads < TEMPL_MIN_READS)
+              continue;
+            // A templated fragment is short relative to what it replaces; a
+            // comparable or larger block is a different rearrangement.
+            if (f.block == 0 || f.block * TEMPL_MAX_FRAG_RATIO >= dlen)
+              continue;
+            bool has_owner = false;
+            for (const auto &o : owned)
+              if (o.first == f.chrom &&
+                  labs(o.second - (long)f.pos) <= PARTNER_SA_TOL)
+                has_owner = true;
+            if (has_owner)
+              continue;
+            keep.push_back(f);
+          }
+          if (keep.empty())
+            continue;
+          if (keep.size() > 1) {
+            // Two unexplained fragments at one deletion: the geometry is not
+            // determined by this evidence alone. Abstain rather than guess.
+            ++ambiguous;
+            spdlog::debug("[TEMPL_INS][AMBIGUOUS] {}:{} len={} {} candidates",
+                          sv.chrom, sv.s, dlen, keep.size());
+            continue;
+          }
+          const SAFragment &f = keep[0];
+          // Germline veto, as everywhere else: a junction the normal also shows
+          // is not somatic.
+          if (_p_normal_bam &&
+              count_partner_sa_reads(_p_normal_bam[0], _p_normal_idx[0],
+                                     _p_normal_hdr[0], f.chrom, f.pos, f.block,
+                                     sv.chrom, (uint)sv.s,
+                                     unordered_set<string>()) >=
+                  (uint)config->germline_min_reads) {
+            spdlog::debug("[TEMPL_INS][GERMLINE] {}:{} -> {}:{} skipped",
+                          sv.chrom, sv.s, f.chrom, f.pos);
+            continue;
+          }
+          // The fragment spans [pos, pos+block). Its far end joins the deletion
+          // START and its near end the deletion END.
+          //
+          // The two brackets are MIRRORED, not equal. bnd_alt() in clipper.cpp
+          // is the reference: a RIGHT clip (primary to the left of the
+          // breakend, which is what the deletion start is) takes
+          // same_strand ? "[" : "]", a LEFT clip (the deletion end) takes
+          // same_strand ? "]" : "[". Emitting the same bracket on both sides
+          // makes one of the two breakends unmatchable, because truvari
+          // requires position AND direction to agree -- exactly how
+          // truthset_19 was missed while truthset_20 matched.
+          const bool same_strand = !f.reverse;
+          const string brk_s = same_strand ? "[" : "]"; // deletion start
+          const string brk_e = same_strand ? "]" : "["; // deletion end
+          const long far = (long)f.pos + (long)f.block;
+          string rb_s(chromosome_seqs[sv.chrom] + sv.s, 1);
+          string rb_e(chromosome_seqs[sv.chrom] + sv.e, 1);
+          SV a("BND", sv.chrom, sv.s, rb_s,
+               rb_s + brk_s + f.chrom + ":" + to_string(far) + brk_s, sv.w, 0,
+               0, 0, true, 0);
+          SV b("BND", sv.chrom, sv.e, rb_e,
+               brk_e + f.chrom + ":" + to_string((long)f.pos) + brk_e + rb_e,
+               sv.w, 0, 0, 0, true, 0);
+          // sv.reads is the already-joined string, not the vector add_reads()
+          // builds: copy it across so the two breakends carry the deletion's
+          // supporting reads verbatim.
+          a.reads = sv.reads;
+          b.reads = sv.reads;
+          a.sa_reads = sv.sa_reads;
+          b.sa_reads = sv.sa_reads;
+          split_svs.push_back(a);
+          split_svs.push_back(b);
+          drop[i] = true;
+          ++recl;
+          spdlog::debug("[TEMPL_INS] {}:{}-{} len={} -> fragment {}:{}+{} "
+                        "({} reads, {})",
+                        sv.chrom, sv.s, sv.e, dlen, f.chrom, f.pos, f.block,
+                        f.nreads, f.reverse ? "-" : "+");
+        }
+        if (recl > 0) {
+          vector<SV> kept;
+          kept.reserve(svs.size());
+          for (size_t i = 0; i < svs.size(); ++i)
+            if (!drop[i])
+              kept.push_back(svs[i]);
+          svs.swap(kept);
+          svs.insert(svs.end(), split_svs.begin(), split_svs.end());
+        }
+        spdlog::info("[TEMPL_INS] {} deletions reclassified as templated "
+                     "insertions ({} abstained: several unexplained fragments)",
+                     recl, ambiguous);
+      } else {
+        spdlog::warn("[TEMPL_INS] could not open tumour BAM {}; skipping",
+                     config->bam);
+      }
+      if (hdr) bam_hdr_destroy(hdr);
+      if (idx) hts_idx_destroy(idx);
+      if (bam) hts_close(bam);
+    }
+
+    // Deferred POA output: now that `svs` is final, write it, then the clipped
+    // records, preserving the original order.
+    spdlog::info("Writing {} SVs.", svs.size());
+    collect_call_stats(svs);
+    apply_gates(svs);
+    write_vcf();
+
     collect_call_stats(kept);
     apply_gates(kept);
     link_bnd_mates(kept);
@@ -1244,15 +1544,22 @@ void Caller::collect_call_stats(vector<SV> &recs) {
     spdlog::warn("[CALL_STATS] tumour BAM unavailable; HP*/ALEN* left at 0");
 
   bam1_t *aln = bam_init1();
-  const int win = 150; // same window the germline test uses
+  // Two independent half-windows, both documented in config.hpp: `win` is gate
+  // A's (length-matched germline evidence, plus the alen_med search), `pwin` is
+  // gate C's (any same-type indel, centred on the breakpoint). Both were a
+  // single hardcoded 150 before. The fetch region must cover the wider of the
+  // two or gate C loses reads.
+  const int win = config->gate_win;
+  const int pwin = config->gate_poly_win;
+  const int fwin = max(win, pwin);
 
   for (SV &sv : recs) {
     const int want = (sv.type == "INS")   ? BAM_CINS
                      : (sv.type == "DEL") ? BAM_CDEL
                                           : -1;
     const int sv_len = abs(sv.l);
-    const string region = sv.chrom + ":" + to_string(max(0, sv.s - win)) + "-" +
-                          to_string(sv.s + sv_len + win);
+    const string region = sv.chrom + ":" + to_string(max(0, sv.s - fwin)) + "-" +
+                          to_string(sv.s + sv_len + fwin);
 
     // ---- tumour: haplotype and carried length of the supporting reads ----
     // The read set is the one named in the record, so anyone can re-derive
@@ -1311,7 +1618,7 @@ void Caller::collect_call_stats(vector<SV> &recs) {
                                    region.c_str());
     if (!it)
       continue;
-    int spanning = 0, lowq = 0, conc = 0, nhp[3] = {0, 0, 0};
+    int spanning = 0, lowq = 0, conc = 0, poly = 0, nhp[3] = {0, 0, 0};
     vector<int> seen_lens;
     while (sam_itr_next(_p_normal_bam[0], it, aln) > 0) {
       if (aln->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP))
@@ -1333,10 +1640,22 @@ void Caller::collect_call_stats(vector<SV> &recs) {
       if (want == -1)
         continue;
       bool hit = false;
+      bool poly_hit = false;
       uint rpos = aln->core.pos;
       for (const auto &op : decode_cigar(aln)) {
         const int bam_op = op.second;
         const int l = (int)op.first;
+        // Gate C numerator. Same op and same size floor as the length-matched
+        // test above, but the window is centred on the BREAKPOINT and does NOT
+        // span the event: `hit` above may legitimately look across sv_len,
+        // because a germline deletion of the same length has its op anywhere in
+        // that range, while gate C asks whether THIS LOCUS is polymorphic. Using
+        // the spanning window flagged truthset_22, a 32.5 kb deletion, because
+        // somewhere inside those 32 kb the normal carries unrelated germline
+        // indels -- 23 reads of 64, which says nothing about its breakpoints.
+        if (bam_op == want && l >= (int)config->min_sv_length &&
+            abs((int)rpos - sv.s) <= pwin)
+          poly_hit = true;
         if (bam_op == want && (int)rpos >= sv.s - win &&
             (int)rpos <= sv.s + sv_len + win &&
             l >= (int)config->min_sv_length) {
@@ -1356,11 +1675,14 @@ void Caller::collect_call_stats(vector<SV> &recs) {
       }
       if (hit)
         ++conc;
+      if (poly_hit)
+        ++poly;
     }
     hts_itr_destroy(it);
     sv.stats.n_exam = spanning;
     sv.stats.n_lowq = lowq;
     sv.stats.n_conc = conc;
+    sv.stats.n_poly = poly;
     sv.stats.nhp0 = nhp[0];
     sv.stats.nhp1 = nhp[1];
     sv.stats.nhp2 = nhp[2];
@@ -1404,7 +1726,21 @@ void Caller::collect_call_stats(vector<SV> &recs) {
 void Caller::apply_gates(vector<SV> &recs) {
   if (!config->gates)
     return;
-  size_t n_germ = 0, n_low = 0;
+  size_t n_germ = 0, n_low = 0, n_poly_g = 0, n_depth = 0;
+  // Gate D needs a reference depth for THIS sample. The median of n_exam over
+  // the records of the run gives it without a second pass over the BAM and
+  // without any external annotation, and it follows the coverage on its own.
+  int depth_ref = 0;
+  {
+    vector<int> ex;
+    for (const SV &sv : recs)
+      if (sv.stats.n_exam > 0)
+        ex.push_back(sv.stats.n_exam);
+    if (!ex.empty()) {
+      sort(ex.begin(), ex.end());
+      depth_ref = ex[ex.size() / 2];
+    }
+  }
   for (SV &sv : recs) {
     // ---- gate A ----
     const int L = sv.stats.alen_med > 0 ? sv.stats.alen_med : abs(sv.l);
@@ -1423,6 +1759,39 @@ void Caller::apply_gates(vector<SV> &recs) {
                     "nlens={}",
                     sv.idx, L, matching, sv.stats.n_lens.size());
       continue; // the normal has spoken; gate B only qualifies silence
+    }
+    // ---- gate C: the locus is length-polymorphic in the normal --------------
+    // Gate A above compares LENGTHS, so it cannot fire where the normal carries
+    // the locus at a different length -- which at a length-polymorphic locus is
+    // the rule, not the exception. Ask a different question: what fraction of
+    // spanning normal reads carries a same-type indel AT ALL. On COLO829 every
+    // true positive sits at exactly 0.00 and eight false positives between 0.33
+    // and 1.00; see gate_poly_frac in config.hpp for the full measurement and
+    // for the one HG008 true positive this deliberately gives up.
+    if (sv.stats.n_exam > 0 && sv.stats.n_poly >= config->gate_poly_min_reads &&
+        (float)sv.stats.n_poly / (float)sv.stats.n_exam >=
+            config->gate_poly_frac) {
+      sv.filter = "POLYNORMAL";
+      ++n_poly_g;
+      spdlog::debug("[GATE_C][POLYNORMAL] {} poly={}/{} = {:.2f} (>= {:.2f})",
+                    sv.idx, sv.stats.n_poly, sv.stats.n_exam,
+                    (float)sv.stats.n_poly / (float)sv.stats.n_exam,
+                    config->gate_poly_frac);
+      continue;
+    }
+    // ---- gate D: mismapping sink -------------------------------------------
+    // Where the normal piles up hundreds of times its usual depth, gate C is
+    // diluted into silence (263 germline reads out of 25568 spanning reads read
+    // as 0.01) and no call at that locus is trustworthy anyway. Distinct FILTER
+    // from GERMLINE on purpose: this says the locus is not callable, not that
+    // the normal carries the allele.
+    if (depth_ref > 0 && sv.stats.n_exam > depth_ref * config->gate_depth_factor) {
+      sv.filter = "REPEATDEPTH";
+      ++n_depth;
+      spdlog::debug("[GATE_D][REPEATDEPTH] {} n_exam={} vs {}x median {}",
+                    sv.idx, sv.stats.n_exam, config->gate_depth_factor,
+                    depth_ref);
+      continue;
     }
     // ---- gate B ----
     // Unphased normal reads do come from one of the two haplotypes: split them
@@ -1454,9 +1823,10 @@ void Caller::apply_gates(vector<SV> &recs) {
                     sv.idx, h1, h2, a, b, u, 1.0 - p_miss);
     }
   }
-  spdlog::info("[GATES] {} flagged GERMLINE (gate A), {} flagged LOWPOWER "
-               "(gate B), {} PASS",
-               n_germ, n_low, recs.size() - n_germ - n_low);
+  spdlog::info("[GATES] {} GERMLINE (A), {} POLYNORMAL (C), {} REPEATDEPTH (D), "
+               "{} LOWPOWER (B), {} PASS",
+               n_germ, n_poly_g, n_depth, n_low,
+               recs.size() - n_germ - n_poly_g - n_depth - n_low);
 }
 
 // True if the reference has an N within +-window bp of a (1-based) position.
@@ -2059,6 +2429,10 @@ void Caller::print_vcf_header() {
           "haplotype the event sits on for its absence from the normal to be "
           "informative: not evidence of germline, absence of evidence\">"
        << endl;
+  cout << "##FILTER=<ID=POLYNORMAL,Description=\"The locus is length-polymorphic in the normal: at least gate_poly_frac of the spanning normal reads carry a same-type indel, regardless of its size (gate C).\">"
+       << endl;
+  cout << "##FILTER=<ID=REPEATDEPTH,Description=\"Normal spanning depth exceeds gate_depth_factor times the median over the run: a mismapping sink, not a callable locus (gate D).\">"
+       << endl;
   cout << "##INFO=<ID=VARTYPE,Number=A,Type=String,Description=\"Variant "
           "class\">"
        << endl;
@@ -2168,6 +2542,10 @@ void Caller::print_vcf_header() {
   cout << "##INFO=<ID=NHP0,Number=1,Type=Integer,Description=\"Spanning normal "
           "reads with no HP tag\">"
        << endl;
+  cout << "##INFO=<ID=NPOLY,Number=1,Type=Integer,Description=\"Spanning "
+          "normal reads carrying a same-type indel >= min_sv_length anywhere in "
+          "the window, with no length comparison against this call. NPOLY/NEXAM "
+          "is what gate C thresholds.\">" << endl;
   cout << "##INFO=<ID=NLENS,Number=.,Type=Integer,Description=\"Lengths of "
           "same-type indels seen in normal reads near the breakpoint\">"
        << endl;

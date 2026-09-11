@@ -133,6 +133,11 @@ struct ClipBndCand {
   uint sa_pos;
   uint sa_ref_len;
   uint clip_w;         // pooled clip-side support (< min_cluster_weight)
+  // Junction detail, carried through so the rescued record is annotated like a
+  // directly emitted one. dq > 0 also marks a junction that skips novel bases,
+  // i.e. a candidate composite junction (see doc/templated_insertions.md).
+  int dq = 0;
+  string ins_seq;
   vector<string> names;
   vector<string> sa_names; // already counted: excluded from the rescue tally
 };
