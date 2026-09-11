@@ -95,8 +95,29 @@ void Clusterer::run() {
                     extsfs.re, extsfs.qs, extsfs.qe);
       extended_SFSs.push_back(extsfs);
     }
-    clips.insert(clips.begin(), _p_clips[i].begin(), _p_clips[i].end());
+    // Append, don't prepend: inserting each thread block at the front both
+    // reversed the thread order and shifted the whole (fat) Clip vector every
+    // time -- ~1.9M element moves for 59k clips.
+    clips.insert(clips.end(), _p_clips[i].begin(), _p_clips[i].end());
   }
+  // Canonical order for the clips, established HERE rather than inside
+  // Clipper::call, because the first consumers there are order-sensitive:
+  // remove_duplicates() keeps the FIRST clip of each read name, and combine()
+  // iterates an unordered_map whose bucket order follows the insertion
+  // sequence. Both ran on the raw per-thread concatenation, so the surviving
+  // clip of a read changed with --threads. Total order: Clip::operator<
+  // compares `p` alone (not even the chromosome), so it is not usable here.
+  sort(clips.begin(), clips.end(), [](const Clip &a, const Clip &b) {
+    if (a.chrom != b.chrom)
+      return a.chrom < b.chrom;
+    if (a.p != b.p)
+      return a.p < b.p;
+    if (a.starting != b.starting)
+      return a.starting < b.starting;
+    if (a.l != b.l)
+      return a.l < b.l;
+    return a.name < b.name;
+  });
   spdlog::info("{}/{}/{} unplaced SFSs. {} erroneus SFSs. {} clipped SFSs.",
                unplaced, s_unplaced, e_unplaced, unknown, clips.size());
 
@@ -104,9 +125,8 @@ void Clusterer::run() {
   spdlog::info("Clustering {} SFSs..", extended_SFSs.size());
   cluster_by_proximity();
   map<pair<int, int>, Cluster> _ext_clusters;
-  for (size_t i = 0; i < _p_sfs_clusters.size(); i++)
-    for (const auto &cluster : _p_sfs_clusters[i])
-      clusters.push_back(Cluster(cluster.second));
+  for (const auto &cluster : _p_sfs_clusters)
+    clusters.push_back(Cluster(cluster));
 
   // 3. Extend SFSs inside each cluster to force them to start/end at same
   // reference position
@@ -306,6 +326,8 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       spdlog::debug("[SFS_FILTER][UNPLACED] read={} chrom={} sfs_qs={} "
                     "sfs_len={} (both boundaries missing)",
                     qname, chrom, sfs.qs, sfs.l);
+      // book-keeping only; racy without this (see fill_clusters)
+#pragma omp atomic
       ++unplaced;
       continue;
     } else if (refs == -1) {
@@ -317,6 +339,7 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
         spdlog::debug("[SFS_FILTER][START_UNPLACED] read={} chrom={} sfs_qs={} "
                       "sfs_len={} (no left boundary)",
                       qname, chrom, sfs.qs, sfs.l);
+#pragma omp atomic
         ++s_unplaced;
       }
       continue; // in any case, we skip this SFS
@@ -329,6 +352,7 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
         spdlog::debug("[SFS_FILTER][END_UNPLACED] read={} chrom={} sfs_qs={} "
                       "sfs_len={} (no right boundary)",
                       qname, chrom, sfs.qs, sfs.l);
+#pragma omp atomic
         ++e_unplaced;
       }
       continue; // in any case, we skip this SFS
@@ -403,6 +427,7 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       spdlog::warn("[SFS_FILTER][UNKNOWN] read={} chrom={} sfs_qs={} "
                    "sfs_len={} (failed fallback placement)",
                    qname, chrom, sfs.qs, sfs.l);
+#pragma omp atomic
       ++unknown;
       continue;
     }
@@ -659,7 +684,33 @@ void Clusterer::cluster_by_proximity() {
     return;
   }
 
-  sort(extended_SFSs.begin(), extended_SFSs.end());
+  // TOTAL order, not SFS::operator<, which compares (chrom, rs) only. The SFSs
+  // arrive here as the concatenation of the per-thread buffers, so their order
+  // is already a function of --threads; ties under a partial order then came
+  // out arranged by whatever introsort happened to do, and that arrangement
+  // reached the result in two places: the interval anchor `prev_e` below (the
+  // `re` of the FIRST SFS of the interval) and the tie-break of the greedy
+  // agglomerative merge (first minimum in index order). Note stable_sort would
+  // NOT have helped -- it preserves an input order that is itself
+  // thread-dependent. Sorting on the content makes both canonical.
+  // Cost: the tie-break comparisons only run on ties, and the comparator
+  // already compared `chrom` as a string, which dominates.
+  // SFS::operator< is left alone: it is shared with the assembler path, which
+  // relies on its empty-chrom special case.
+  sort(extended_SFSs.begin(), extended_SFSs.end(),
+       [](const SFS &a, const SFS &b) {
+         if (a.chrom != b.chrom)
+           return a.chrom < b.chrom;
+         if (a.rs != b.rs)
+           return a.rs < b.rs;
+         if (a.re != b.re)
+           return a.re < b.re;
+         if (a.qs != b.qs)
+           return a.qs < b.qs;
+         if (a.qe != b.qe)
+           return a.qe < b.qe;
+         return a.qname < b.qname;
+       });
   auto r = max_element(extended_SFSs.begin(), extended_SFSs.end(),
                        [](const SFS &lhs, const SFS &rhs) {
                          return lhs.re - lhs.rs < rhs.re - rhs.rs;
@@ -726,6 +777,10 @@ void Clusterer::cluster_by_proximity() {
   // thread-dependent clustering results
   vector<map<pair<int, int>, vector<SFS>>> _interval_sfs_clusters(
       intervals.size());
+  // Distinct HAC clusters of the same interval that share a span land on the
+  // same key below and get merged. Counted, not fixed, so that the effect of
+  // the flatten fix can be measured on its own.
+  vector<size_t> _interval_span_merges(intervals.size(), 0);
 #pragma omp parallel for num_threads(config->threads) schedule(static, 1)
   for (size_t i = 0; i < intervals.size(); i++) {
     int start_j = intervals[i].first;
@@ -874,6 +929,8 @@ void Clusterer::cluster_by_proximity() {
         low = min(low, extended_SFSs[start_j + idx].rs);
         high = max(high, extended_SFSs[start_j + idx].re);
       }
+      if (_interval_sfs_clusters[i].count(make_pair(low, high)))
+        ++_interval_span_merges[i];
 
       for (int idx : cl_indices) {
         _interval_sfs_clusters[i][make_pair(low, high)].push_back(
@@ -889,18 +946,37 @@ void Clusterer::cluster_by_proximity() {
                   intervals[i].first, intervals[i].second,
                   _interval_sfs_clusters[i].size(), total_sfs);
   }
-  // Flatten into _p_sfs_clusters for compatibility
-  _p_sfs_clusters.resize(1);
-  for (size_t i = 0; i < intervals.size(); i++)
-    for (const auto &cluster : _interval_sfs_clusters[i])
-      _p_sfs_clusters[0][cluster.first] = cluster.second;
+  // Flatten, in interval (= genome) order. Every cluster is kept: the old
+  // chromosome-less (rs, re) map erased a cluster whenever a later interval,
+  // on another chromosome, produced the same span. `old_lost_*` replays that
+  // behaviour only to report what it used to cost.
+  _p_sfs_clusters.clear();
+  map<pair<int, int>, size_t> old_last_size;
+  size_t old_lost_clusters = 0, old_lost_sfs = 0, span_merges = 0;
+  for (size_t i = 0; i < intervals.size(); i++) {
+    span_merges += _interval_span_merges[i];
+    for (auto &cluster : _interval_sfs_clusters[i]) {
+      auto it = old_last_size.find(cluster.first);
+      if (it != old_last_size.end()) {
+        ++old_lost_clusters;
+        old_lost_sfs += it->second;
+        it->second = cluster.second.size();
+      } else
+        old_last_size.emplace(cluster.first, cluster.second.size());
+      _p_sfs_clusters.push_back(std::move(cluster.second));
+    }
+  }
 
-  size_t total_clusters = _p_sfs_clusters[0].size();
+  size_t total_clusters = _p_sfs_clusters.size();
   size_t total_sfs = 0;
-  for (const auto &cluster : _p_sfs_clusters[0])
-    total_sfs += cluster.second.size();
+  for (const auto &cluster : _p_sfs_clusters)
+    total_sfs += cluster.size();
   spdlog::info("[CLUSTERING] Final clusters={} total_assigned_sfs={}.",
                 total_clusters, total_sfs);
+  spdlog::info("[CLUSTERING] cross-chromosome span collisions (dropped by the "
+               "old flatten, now kept): clusters={} sfs={}. Same-interval span "
+               "merges (still merged): {}.",
+               old_lost_clusters, old_lost_sfs, span_merges);
 }
 
 // /* Assign coverage and read (sub)sequence to each cluster  */
@@ -921,7 +997,15 @@ void Clusterer::fill_clusters() {
     bgzf_mt(_p_bam_file[i]->fp.bgzf, 8, 1);
   }
 
-#pragma omp parallel for num_threads(config->threads) schedule(static, 1)
+  // Book-keeping counters via reduction, not plain member increments: they were
+  // written from every thread with no synchronisation, so the numbers reported
+  // below drifted from run to run even at identical settings and made runs that
+  // WERE reproducible look like they were not. `small_clusters` alone fires
+  // ~1.5M times, so an atomic on one shared word would bounce a single cache
+  // line across all threads; per-thread private copies cost nothing.
+  size_t n_small = 0, n_unextended = 0, n_small_2 = 0;
+#pragma omp parallel for num_threads(config->threads) schedule(static, 1)       \
+    reduction(+ : n_small, n_unextended, n_small_2)
   for (size_t i = 0; i < clusters.size(); i++) {
     int t = omp_get_thread_num();
     Cluster &cluster = clusters[i];
@@ -943,7 +1027,7 @@ void Clusterer::fill_clusters() {
                     "uniq_reads={} min_required={}",
                     cluster.chrom, min_s, max_e, cluster_size,
                     config->min_cluster_weight);
-      ++small_clusters;
+      ++n_small;
       continue;
     }
 
@@ -1024,7 +1108,7 @@ void Clusterer::fill_clusters() {
         spdlog::debug("[SFS_FILTER][UNEXTENDED_IN_CLUSTER] cluster={}:{}-{} "
                       "read={} (cannot project full cluster interval on read)",
                       cluster.chrom, min_s, max_e, qname);
-        ++unextended;
+        ++n_unextended;
       } else {
         string _seq(seq[t], qs, qe - qs + 1);
         cluster.add_subread(qname, _seq, hp_t);
@@ -1038,9 +1122,12 @@ void Clusterer::fill_clusters() {
                     "end={} subreads={} min_required={}",
                     cluster.chrom, min_s, max_e, cluster.size(),
                     config->min_cluster_weight);
-      ++small_clusters_2;
+      ++n_small_2;
     }
   }
+  small_clusters = n_small;
+  unextended = n_unextended;
+  small_clusters_2 = n_small_2;
 
   // clean
   for (int i = 0; i < config->threads; i++) {

@@ -236,6 +236,57 @@ uint Caller::count_partner_sa_reads(samFile *bam, hts_idx_t *idx,
   return count;
 }
 
+// TOTAL order on calls. SV::operator< compares (chrom, s) only, so every
+// same-position call was a tie and std::sort arranged the ties according to the
+// input permutation -- which is the per-thread concatenation below, i.e. a
+// function of --threads. Two consumers read that arrangement: clean_dups(),
+// which only ever compares a call with its IMMEDIATE predecessor, and
+// filter_sv_chains(), which walks neighbours.
+//
+// Ordering on (refall, altall) before the rest is what clean_dups() needs: it
+// matches on (chrom, s, refall, altall), so under this order true duplicates
+// are adjacent BY CONSTRUCTION. Previously they were removed only when chance
+// happened to place them next to each other, so clean_dups() was also missing
+// duplicates, not just behaving non-reproducibly.
+static bool sv_total_order(const SV &a, const SV &b) {
+  if (a.chrom != b.chrom)
+    return a.chrom < b.chrom;
+  if (a.s != b.s)
+    return a.s < b.s;
+  if (a.refall != b.refall)
+    return a.refall < b.refall;
+  if (a.altall != b.altall)
+    return a.altall < b.altall;
+  if (a.type != b.type)
+    return a.type < b.type;
+  if (a.l != b.l)
+    return a.l < b.l;
+  if (a.e != b.e)
+    return a.e < b.e;
+  // Beyond this point the two records describe the SAME event, called from two
+  // different haplotype subclusters of the same cluster: same geometry, same
+  // alleles, different supporting reads. clean_dups() keeps whichever comes
+  // first, so without a tie-break here the survivor was still chosen by the
+  // arrangement of the input -- observed on chr16:36094467, kept with WEIGHT=22
+  // (H1) at 64 and 16 threads and with WEIGHT=7 (H2) at 32.
+  //
+  // WEIGHT DESCENDING is therefore not just a tie-break, it is a choice: of two
+  // records for one event, keep the better-supported one. `reads` (the list of
+  // supporting read names) closes the order for good, since two genuinely
+  // distinct subclusters cannot share it.
+  if (a.w != b.w)
+    return a.w > b.w;
+  if (a.cov != b.cov)
+    return a.cov > b.cov;
+  if (a.cov1 != b.cov1)
+    return a.cov1 > b.cov1;
+  if (a.cov2 != b.cov2)
+    return a.cov2 > b.cov2;
+  if (a.gt != b.gt)
+    return a.gt < b.gt;
+  return a.reads < b.reads;
+}
+
 void Caller::run() {
   config = Configuration::getInstance();
 
@@ -286,22 +337,28 @@ void Caller::run() {
   // NOTE: the normal-contigs BAM is kept open here; it is also used by the
   // germline filter on the clipped-SFS calls below, and freed afterwards.
   for (int i = 0; i < config->threads; i++) {
-    svs.insert(svs.begin(), _p_svs[i].begin(), _p_svs[i].end());
-    alignments.insert(alignments.begin(), _p_alignments[i].begin(),
+    // Append, don't prepend: prepending reversed the thread order and shifted
+    // the whole vector on every block.
+    svs.insert(svs.end(), _p_svs[i].begin(), _p_svs[i].end());
+    alignments.insert(alignments.end(), _p_alignments[i].begin(),
                       _p_alignments[i].end());
   }
-  sort(svs.begin(), svs.end());
+  sort(svs.begin(), svs.end(), sv_total_order);
   clean_dups();
   spdlog::info("{} SVs before chain filtering.", svs.size());
-  // secondary sort by |svlen| so that same-position calls are adjacent by length;
-  // this makes the chain filter deterministic and effective for same-position duplicates
+  // Secondary sort by |svlen|, so that same-position calls are adjacent by
+  // length for the chain filter. Now expressed as a real strict weak ordering:
+  // the previous comparator returned false whenever chrom or s differed, which
+  // makes incomparability non-transitive (a<c can hold while a~b and b~c) and
+  // is undefined behaviour for stable_sort. The vector is already in (chrom, s)
+  // order here, so the outcome is the intended one either way -- but defined.
   stable_sort(svs.begin(), svs.end(), [](const SV &a, const SV &b) {
-    if (a.chrom != b.chrom) return false;
-    if (a.s != b.s) return false;
+    if (a.chrom != b.chrom) return a.chrom < b.chrom;
+    if (a.s != b.s) return a.s < b.s;
     return abs(a.l) < abs(b.l);
   });
   filter_sv_chains();
-  sort(svs.begin(), svs.end());
+  sort(svs.begin(), svs.end(), sv_total_order);
   // Needs the sort (it walks neighbours) and must precede the stats, so that a
   // merged record is measured over its full span.
   merge_fragmented_dels(svs);
@@ -489,7 +546,7 @@ void Caller::run() {
     // Left-clip and right-clip SA paths independently call the same large
     // deletion from opposite breakpoints; RO with max() denominator merges
     // them while preserving truly distinct events of different sizes.
-    sort(clipped_svs.begin(), clipped_svs.end());
+    sort(clipped_svs.begin(), clipped_svs.end(), sv_total_order);
     vector<bool> suppressed(clipped_svs.size(), false);
     for (size_t i = 0; i < clipped_svs.size(); i++) {
       if (suppressed[i]) continue;

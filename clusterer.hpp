@@ -175,7 +175,12 @@ private:
   vector<vector<Clip>> _p_clips;
   vector<vector<SFS>> _p_extended_sfs;
   vector<vector<vector<bam1_t *>>> bam_entries;
-  vector<map<pair<int, int>, vector<SFS>>> _p_sfs_clusters;
+  // Flat list of SFS clusters, in genome order. Was a map keyed on (rs, re)
+  // WITHOUT the chromosome, flattened with `=`: two clusters on different
+  // chromosomes with the same span collided and the later one silently erased
+  // the earlier (691 SFS lost on HG008, 515 on COLO829). The key was never read
+  // downstream -- the consumer takes only the SFS vector -- so it is dropped.
+  vector<vector<SFS>> _p_sfs_clusters;
 
 public:
   Clusterer(unordered_map<string, vector<SFS>> *, bool sfs_from_fasta);
