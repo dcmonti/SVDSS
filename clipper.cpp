@@ -127,20 +127,33 @@ static uint sa_junction(const Clip &c) {
 // Breakend ALT for a clip cluster, in ONE place so the emission and the
 // sub-threshold rescue candidate can never disagree on the geometry.
 //
-// `mate` is the SA end adjacent to the junction. For a LEFT clip the primary
-// lies to the RIGHT of the breakend, so the mate piece precedes refbase and the
-// adjacent SA end is sa_pos+sa_ref_len when both segments map on the same
-// strand; a RIGHT clip is the mirror image. ']' keeps the mate piece forward,
-// '[' takes it reverse-complemented.
+// `mate` is the SA base adjacent to the junction, 1-based like the SA tag. For
+// a LEFT clip the primary lies to the RIGHT of the breakend, so the mate piece
+// precedes refbase and the adjacent SA base is the LAST one of the segment,
+// sa_pos + sa_ref_len - 1, when both segments map on the same strand; a RIGHT
+// clip is the mirror image. ']' keeps the mate piece forward, '[' takes it
+// reverse-complemented. sa_pos + sa_ref_len alone is one base past the segment,
+// which is what made every mate ALT disagree by one with the POS of the record
+// that the other side of the junction writes.
 static string bnd_alt(const Clip &c, bool is_left, const string &refbase) {
   const bool same_strand = (c.primary_reverse == c.sa_reverse);
-  const uint mate = is_left
-                        ? (same_strand ? c.sa_pos + c.sa_ref_len : c.sa_pos)
-                        : (same_strand ? c.sa_pos : c.sa_pos + c.sa_ref_len);
+  const uint sa_last = c.sa_pos + c.sa_ref_len - 1;
+  const uint mate = is_left ? (same_strand ? sa_last : c.sa_pos)
+                            : (same_strand ? c.sa_pos : sa_last);
   const string br =
       is_left ? (same_strand ? "]" : "[") : (same_strand ? "[" : "]");
   const string m = br + c.sa_chrom + ":" + to_string(mate) + br;
   return is_left ? m + refbase : refbase + m;
+}
+
+// VCF POS (1-based) of a clip's breakend: the aligned base next to the clip.
+// c.p is htslib's 0-based coordinate, which means two different things on the
+// two sides: the first aligned base for a LEFT clip (core.pos), one past the last
+// aligned base for a RIGHT clip (bam_endpos). The 1-based POS is therefore p + 1
+// on the left and p itself on the right, and the REF base is always the
+// reference at POS - 1 in 0-based terms.
+static uint bnd_pos(const Clip &c, bool is_left) {
+  return is_left ? c.p + 1 : c.p;
 }
 
 static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
@@ -1116,7 +1129,8 @@ void Clipper::call(int threads,
            ClipBndCand bc;
            bc.chrom = chrom;
            bc.p = lc.p;
-           bc.refbase = string(chromosome_seqs[chrom] + lc.p, 1);
+           bc.pos = bnd_pos(lc, true);
+           bc.refbase = string(chromosome_seqs[chrom] + bc.pos - 1, 1);
            bc.alt = bnd_alt(lc, true, bc.refbase);
            bc.sa_chrom = lc.sa_chrom;
            bc.sa_pos = lc.sa_pos;
@@ -1140,10 +1154,11 @@ void Clipper::call(int threads,
            // this breakend (see the reciprocal BND pooling above).
            uint bnd_w = max(lc.w, lbnd_pool[i]);
            const uint bnd_gate = Configuration::getInstance()->min_cluster_weight;
-           string refbase(chromosome_seqs[chrom] + lc.p, 1);
+           const uint pos = bnd_pos(lc, true);
+           string refbase(chromosome_seqs[chrom] + pos - 1, 1);
            string alt = bnd_alt(lc, true, refbase);
            if (bnd_w >= bnd_gate) {
-               SV sv = SV("BND", chrom, lc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
+               SV sv = SV("BND", chrom, pos, refbase, alt, bnd_w, 0, 0, 0, true, 0);
                // The junction detail was previously dropped for BND: dq lived in the
                // Clip and never reached the record, so a composite junction -- one
                // that skips a short templated fragment -- was indistinguishable from
@@ -1345,7 +1360,8 @@ void Clipper::call(int threads,
            ClipBndCand bc;
            bc.chrom = chrom;
            bc.p = rc.p;
-           bc.refbase = string(chromosome_seqs[chrom] + rc.p, 1);
+           bc.pos = bnd_pos(rc, false);
+           bc.refbase = string(chromosome_seqs[chrom] + bc.pos - 1, 1);
            bc.alt = bnd_alt(rc, false, bc.refbase);
            bc.sa_chrom = rc.sa_chrom;
            bc.sa_pos = rc.sa_pos;
@@ -1367,10 +1383,11 @@ void Clipper::call(int threads,
            // Gate on the pooled weight (see the left-clip loop).
            uint bnd_w = max(rc.w, rbnd_pool[i]);
            const uint bnd_gate = Configuration::getInstance()->min_cluster_weight;
-           string refbase(chromosome_seqs[chrom] + rc.p, 1);
+           const uint pos = bnd_pos(rc, false);
+           string refbase(chromosome_seqs[chrom] + pos - 1, 1);
            string alt = bnd_alt(rc, false, refbase);
            if (bnd_w >= bnd_gate) {
-               SV sv = SV("BND", chrom, rc.p, refbase, alt, bnd_w, 0, 0, 0, true, 0);
+               SV sv = SV("BND", chrom, pos, refbase, alt, bnd_w, 0, 0, 0, true, 0);
                // The junction detail was previously dropped for BND: dq lived in the
                // Clip and never reached the record, so a composite junction -- one
                // that skips a short templated fragment -- was indistinguishable from

@@ -185,7 +185,8 @@ private:
   // (and, for BND, at the mate breakpoint too).
   bool excluded_by_bed_or_N(const SV &sv) const;
 
-  void link_bnd_mates(vector<SV> &records);
+  // Link, reconcile and complete the BND junction pairs of a final record list.
+  void pair_bnd_mates(vector<SV> &records);
   void print_vcf_header();
 };
 

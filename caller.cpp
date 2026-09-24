@@ -4,6 +4,9 @@
 #include <cstdlib>
 #include <string>
 
+// Defined with the BND pairing, below Caller::run().
+static size_t drop_vetoed_mates(vector<SV> &records, const vector<SV> &vetoed);
+
 // Count primary tumour reads that represent a deletion [s, s+len] as a single
 // CIGAR D op reciprocally overlapping the interval by >= 0.5. These "through"
 // reads are minimap2's non-clipped representation of a < ~15 kbp deletion and
@@ -512,7 +515,7 @@ void Caller::run() {
                           bc.chrom, bc.p, bc.sa_chrom, bc.sa_pos);
             continue;
           }
-          SV sv("BND", bc.chrom, bc.p, bc.refbase, bc.alt,
+          SV sv("BND", bc.chrom, bc.pos, bc.refbase, bc.alt,
                 bc.clip_w + n_sup, 0, 0, 0, true, 0);
           // Same junction detail a directly emitted BND now carries. Done here
           // rather than in Clipper because the SV only exists once the rescue
@@ -572,6 +575,7 @@ void Caller::run() {
     // the BND mates among the SURVIVORS, then print. Linking before filtering
     // would let a MATEID name a record that is dropped a few lines later.
     vector<SV> kept;
+    vector<SV> germline_bnds;
     for (size_t i = 0; i < clipped_svs.size(); i++) {
       const SV &sv = clipped_svs[i];
       if (suppressed[i]) continue;
@@ -583,10 +587,19 @@ void Caller::run() {
         // read split (clip+SA), so the germline signal is a normal contig split
         // the same way — checked via the contigs' SA, not CIGAR I/D ops.
         // Serial loop → t=0.
-        if (_p_normal_bam && is_germline_breakend(sv, 0))
+        if (_p_normal_bam && is_germline_breakend(sv, 0)) {
+          if (sv.type == "BND")
+            germline_bnds.push_back(sv);
           continue;
+        }
         kept.push_back(sv);
       }
+    }
+    // The germline check looks at one breakend at a time; a junction whose
+    // normal split was caught on one side only goes with it on the other.
+    if (!germline_bnds.empty()) {
+      const size_t n = drop_vetoed_mates(kept, germline_bnds);
+      spdlog::info("[BND] {} breakends dropped with their germline mate.", n);
     }
     // ---- Templated-insertion reclassification -------------------------------
     // A short fragment copied from a third locus and spliced into a junction is
@@ -698,13 +711,20 @@ void Caller::run() {
           const bool same_strand = !f.reverse;
           const string brk_s = same_strand ? "[" : "]"; // deletion start
           const string brk_e = same_strand ? "]" : "["; // deletion end
-          const long far = (long)f.pos + (long)f.block;
-          string rb_s(chromosome_seqs[sv.chrom] + sv.s, 1);
-          string rb_e(chromosome_seqs[sv.chrom] + sv.e, 1);
+          //
+          // Coordinates are 1-based throughout. A POA deletion has POS = sv.s,
+          // the anchor base before the deleted span, and END = sv.e, its last
+          // deleted base: the deletion-start breakend is the anchor itself and
+          // the deletion-end breakend is the first base after the span, sv.e + 1.
+          // The fragment is the SA segment [f.pos, f.pos + f.block - 1].
+          const long far = (long)f.pos + (long)f.block - 1;
+          const uint pos_e = (uint)sv.e + 1;
+          string rb_s(chromosome_seqs[sv.chrom] + sv.s - 1, 1);
+          string rb_e(chromosome_seqs[sv.chrom] + pos_e - 1, 1);
           SV a("BND", sv.chrom, sv.s, rb_s,
                rb_s + brk_s + f.chrom + ":" + to_string(far) + brk_s, sv.w, 0,
                0, 0, true, 0);
-          SV b("BND", sv.chrom, sv.e, rb_e,
+          SV b("BND", sv.chrom, pos_e, rb_e,
                brk_e + f.chrom + ":" + to_string((long)f.pos) + brk_e + rb_e,
                sv.w, 0, 0, 0, true, 0);
           // sv.reads is the already-joined string, not the vector add_reads()
@@ -746,6 +766,22 @@ void Caller::run() {
 
     // Deferred POA output: now that `svs` is final, write it, then the clipped
     // records, preserving the original order.
+    //
+    // The breakends the templated-insertion reclassification put into `svs`
+    // join the clipped ones, so that all BNDs are paired in one list: a mate is
+    // looked for among every breakend that is written, not only those of the
+    // same phase. They pass the exclusion write_vcf() would have applied.
+    {
+      vector<SV> poa;
+      poa.reserve(svs.size());
+      for (SV &sv : svs) {
+        if (sv.type != "BND")
+          poa.push_back(std::move(sv));
+        else if (!excluded_by_bed_or_N(sv))
+          kept.push_back(std::move(sv));
+      }
+      svs.swap(poa);
+    }
     spdlog::info("Writing {} SVs.", svs.size());
     collect_call_stats(svs);
     apply_gates(svs);
@@ -753,7 +789,7 @@ void Caller::run() {
 
     collect_call_stats(kept);
     apply_gates(kept);
-    link_bnd_mates(kept);
+    pair_bnd_mates(kept);
     for (const SV &sv : kept)
       cout << sv << endl;
   }
@@ -772,89 +808,244 @@ void Caller::run() {
   destroy_chromosomes();
 }
 
-// Pair up the two breakends of each translocation junction and cross-reference
-// them with MATEID. The link is rebuilt from the records themselves rather than
-// carried down from the clipper: the two breakends are emitted independently
-// (different clip clusters, different threads) and either one can still be
-// dropped by a downstream filter, so the only moment both IDs are known for
-// certain is here, with the final list in hand.
+// ---- BND junctions --------------------------------------------------------
+// VCF 4.2 §5.4 describes a junction by TWO records that name each other: A's ALT
+// holds B's CHROM:POS, B's ALT holds A's, and the bracket/side of each follows
+// from the other. The four shapes, and what the mate of each must look like:
 //
-// Matching is by GEOMETRY, not by identifier: record A names B's locus in its
-// ALT and B names A's, so a junction is a pair that points at each other. The
-// two coordinates can disagree by a base or two — each side reads the boundary
-// off its own alignment — hence the tolerance.
-void Caller::link_bnd_mates(vector<SV> &records) {
-  const int MATE_TOL = 100;
-  // Breakend named by a BND ALT: ]chr:pos]T, [chr:pos[T, T[chr:pos[, T]chr:pos]
-  auto alt_target = [](const string &alt, string &chrom, int &pos) -> bool {
-    size_t b = alt.find_first_of("[]");
-    if (b == string::npos)
-      return false;
-    size_t e = alt.find_first_of("[]", b + 1);
-    if (e == string::npos || e <= b + 1)
-      return false;
-    const string inner = alt.substr(b + 1, e - b - 1);
-    const size_t colon = inner.rfind(':');
-    if (colon == string::npos || colon + 1 >= inner.size())
-      return false;
-    chrom = inner.substr(0, colon);
-    try {
-      pos = stoi(inner.substr(colon + 1));
-    } catch (const std::exception &) {
-      return false;
-    }
-    return true;
-  };
+//     A: t[p[   <->   B: ]a]t        A: ]p]t   <->   B: t[a[
+//     A: t]p]   <->   B: t]a]        A: [p[t   <->   B: [a[t
+//
+// i.e. the mate is a LEFT breakend (ALT opens with the bracket) iff A's bracket
+// is '[', and its bracket is '[' iff A is a left breakend. Consumers such as
+// Minda pair two records only when the coordinates are exactly reciprocal, and
+// fall back to reading each record as an event of its own otherwise, so a
+// junction written with a 1 bp disagreement is counted twice.
+namespace {
+struct Breakend {
+  bool left;     // ALT opens with the bracket: the joined piece precedes REF
+  char br;       // '[' or ']'
+  string mchrom; // locus named by the ALT
+  long mpos;
+};
 
-  vector<size_t> bnds;
-  vector<string> tgt_chrom;
-  vector<int> tgt_pos;
+bool parse_breakend(const string &alt, Breakend &b) {
+  const size_t o = alt.find_first_of("[]");
+  if (o == string::npos)
+    return false;
+  const size_t c = alt.find(alt[o], o + 1);
+  if (c == string::npos || c <= o + 1)
+    return false;
+  const string inner = alt.substr(o + 1, c - o - 1);
+  const size_t colon = inner.rfind(':');
+  if (colon == string::npos || colon + 1 >= inner.size())
+    return false;
+  b.left = (o == 0);
+  b.br = alt[o];
+  b.mchrom = inner.substr(0, colon);
+  try {
+    b.mpos = stol(inner.substr(colon + 1));
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
+}
+
+string breakend_alt(bool left, char br, const string &refbase,
+                    const string &mchrom, long mpos) {
+  const string m = br + mchrom + ":" + to_string(mpos) + br;
+  return left ? m + refbase : refbase + m;
+}
+
+// Orientation the other record of the junction must have (see the table above).
+bool mate_left(const Breakend &b) { return b.br == '['; }
+char mate_br(const Breakend &b) { return b.left ? '[' : ']'; }
+} // namespace
+
+// Two breakends are the two sides of one junction when each names the other's
+// locus within `tol` AND their orientations are the complementary pair. The
+// orientation test is not a nicety: two junctions a few bp apart (a balanced
+// rearrangement, HG008 chr5:20023771/20023781 <-> chr5:155777975/155777978) are
+// within any positional tolerance of each other, and pairing on position alone
+// crossed them.
+static bool bnd_mates(const SV &a, const Breakend &ba, const SV &b,
+                      const Breakend &bb, long tol, long &dist) {
+  if (ba.mchrom != b.chrom || bb.mchrom != a.chrom)
+    return false;
+  if (mate_left(ba) != bb.left || mate_br(ba) != bb.br)
+    return false;
+  const long da = labs(ba.mpos - (long)b.s), db = labs(bb.mpos - (long)a.s);
+  if (da > tol || db > tol)
+    return false;
+  dist = da + db;
+  return true;
+}
+
+// Reciprocal breakends are two independent estimates of the same junction (two
+// clip clusters, two SA votes), so they are matched with a tolerance; once
+// matched they are rewritten to agree exactly.
+static const long BND_MATE_TOL = 100;
+
+// Drop every BND of `records` whose mate is in `vetoed`. A filter that removes
+// one side of a junction removes the other: the germline check is made per
+// record, and the side that was not caught would otherwise survive (and, being
+// alone, get its mate rebuilt by pair_bnd_mates).
+static size_t drop_vetoed_mates(vector<SV> &records, const vector<SV> &vetoed) {
+  vector<Breakend> vb(vetoed.size());
+  vector<bool> vok(vetoed.size(), false);
+  for (size_t j = 0; j < vetoed.size(); j++)
+    vok[j] = vetoed[j].type == "BND" && parse_breakend(vetoed[j].altall, vb[j]);
+  size_t dropped = 0;
+  vector<SV> out;
+  out.reserve(records.size());
+  for (SV &sv : records) {
+    Breakend b;
+    bool veto = false;
+    if (sv.type == "BND" && parse_breakend(sv.altall, b)) {
+      long d;
+      for (size_t j = 0; j < vetoed.size() && !veto; j++)
+        veto = vok[j] && bnd_mates(sv, b, vetoed[j], vb[j], BND_MATE_TOL, d);
+    }
+    if (veto)
+      ++dropped;
+    else
+      out.push_back(std::move(sv));
+  }
+  records.swap(out);
+  return dropped;
+}
+
+// Turn the BND records into VCF junction pairs. Runs on the FINAL list (after
+// every filter and gate), so no MATEID can name a record that is not written.
+//
+//   - Two records that are the two sides of a junction (bnd_mates) are linked
+//     with MATEID and their ALTs rewritten to name each other's POS exactly.
+//     Each side keeps its own POS: it is read off that side's primary
+//     alignments, which the other side only estimates through an SA tag. The
+//     pair gets one FILTER, PASS only if both sides passed, so a PASS-only
+//     benchmark cannot keep half a junction.
+//   - A junction seen from one side only gets its other record BUILT from the
+//     same ALT: the locus it names, the complementary orientation, and an ALT
+//     pointing back at the observed record. It carries the observed record's
+//     evidence (WEIGHT, reads, stats, FILTER) and MATEINFERRED. Leaving it as a
+//     single record is not neutral: a consumer that pairs by MATEID or by
+//     reciprocal ALT, as Minda does once any pair in the file is reciprocal,
+//     reads a lone BND with SVLEN=0 as a zero-length event on its own
+//     chromosome and loses the translocation.
+//   - A breakend whose partner locus is not in the reference cannot be built and
+//     stays single, without MATEID.
+void Caller::pair_bnd_mates(vector<SV> &records) {
+  vector<size_t> bi;
+  vector<Breakend> be;
   for (size_t i = 0; i < records.size(); i++) {
     if (records[i].type != "BND")
       continue;
-    string c;
-    int p;
-    if (!alt_target(records[i].altall, c, p))
+    records[i].mate_id.clear();
+    Breakend b;
+    if (!parse_breakend(records[i].altall, b))
       continue;
-    bnds.push_back(i);
-    tgt_chrom.push_back(c);
-    // The ALT carries a 1-based coordinate while SV::s is the 0-based clip
-    // position, the same convention the rest of the record uses.
-    tgt_pos.push_back(p > 0 ? p - 1 : 0);
+    bi.push_back(i);
+    be.push_back(b);
   }
 
-  size_t linked = 0;
-  for (size_t a = 0; a < bnds.size(); a++) {
-    SV &sa = records[bnds[a]];
-    if (!sa.mate_id.empty())
+  // Greedy in record order (deterministic: the list is sorted by
+  // sv_total_order upstream), each breakend taking its closest free mate.
+  vector<long> mate(bi.size(), -1);
+  size_t pairs = 0, moved = 0, split_filter = 0;
+  for (size_t a = 0; a < bi.size(); a++) {
+    if (mate[a] >= 0)
       continue;
-    for (size_t b = a + 1; b < bnds.size(); b++) {
-      SV &sb = records[bnds[b]];
-      if (!sb.mate_id.empty())
+    long best = -1, best_d = 0;
+    for (size_t b = a + 1; b < bi.size(); b++) {
+      long d;
+      if (mate[b] >= 0 ||
+          !bnd_mates(records[bi[a]], be[a], records[bi[b]], be[b],
+                     BND_MATE_TOL, d))
         continue;
-      if (tgt_chrom[a] != sb.chrom || tgt_chrom[b] != sa.chrom)
-        continue;
-      if (abs(tgt_pos[a] - sb.s) > MATE_TOL || abs(tgt_pos[b] - sa.s) > MATE_TOL)
-        continue;
-      sa.mate_id = sb.idx;
-      sb.mate_id = sa.idx;
-      linked++;
-      break;
+      if (best < 0 || d < best_d) {
+        best = (long)b;
+        best_d = d;
+      }
     }
+    if (best < 0)
+      continue;
+    mate[a] = best;
+    mate[best] = (long)a;
+    SV &x = records[bi[a]];
+    SV &y = records[bi[best]];
+    if (best_d != 0)
+      ++moved;
+    x.altall = breakend_alt(be[a].left, be[a].br, x.refall, y.chrom, y.s);
+    y.altall = breakend_alt(be[best].left, be[best].br, y.refall, x.chrom, x.s);
+    x.mate_id = y.idx;
+    y.mate_id = x.idx;
+    if (x.filter != y.filter) {
+      ++split_filter;
+      const string f = x.filter != "PASS" ? x.filter : y.filter;
+      x.filter = f;
+      y.filter = f;
+    }
+    ++pairs;
   }
-  spdlog::info("Linked {} BND mate pairs out of {} breakend records.", linked,
-               bnds.size());
+
+  unordered_set<string> ids;
+  for (const SV &sv : records)
+    ids.insert(sv.idx);
+  vector<SV> built;
+  size_t unbuildable = 0;
+  for (size_t a = 0; a < bi.size(); a++) {
+    if (mate[a] >= 0)
+      continue;
+    SV &x = records[bi[a]];
+    const Breakend &b = be[a];
+    auto it = chromosome_seqs.find(b.mchrom);
+    if (it == chromosome_seqs.end() || it->second == nullptr || b.mpos < 1 ||
+        b.mpos > (long)strlen(it->second)) {
+      ++unbuildable;
+      continue;
+    }
+    const string refbase(it->second + b.mpos - 1, 1);
+    SV m("BND", b.mchrom, (uint)b.mpos, refbase,
+         breakend_alt(mate_left(b), mate_br(b), refbase, x.chrom, x.s), x.w,
+         x.cov, 0, 0, true, 0);
+    if (ids.count(m.idx))
+      m.idx += "_mate";
+    ids.insert(m.idx);
+    m.set_cov(x.cov, x.cov0, x.cov1, x.cov2);
+    m.reads = x.reads;
+    m.sa_reads = x.sa_reads;
+    m.stats = x.stats;
+    m.filter = x.filter;
+    // Lengths only: the junction sequence read from the mate's side is the
+    // reverse complement whenever the two pieces are joined inverted.
+    m.ins_len = x.ins_len;
+    m.hom_len = x.hom_len;
+    m.mate_inferred = true;
+    m.mate_id = x.idx;
+    x.mate_id = m.idx;
+    built.push_back(std::move(m));
+  }
+  records.insert(records.end(), built.begin(), built.end());
+  spdlog::info("[BND] {} breakends: {} reciprocal pairs ({} with coordinates "
+               "reconciled, {} with FILTER unified), {} mates built from a "
+               "single side, {} left single (partner locus not in reference).",
+               bi.size(), pairs, moved, split_filter, built.size(),
+               unbuildable);
 }
 
 void Caller::write_vcf() {
-  link_bnd_mates(svs);
+  // Exclusion first, pairing second: a mate is only linked to, or built for, a
+  // record that is actually written.
+  vector<SV> out;
+  out.reserve(svs.size());
+  for (const SV &sv : svs)
+    if (!excluded_by_bed_or_N(sv))
+      out.push_back(sv);
+  svs.swap(out);
+  pair_bnd_mates(svs);
   print_vcf_header();
-  for (const SV &sv : svs) {
-    if (excluded_by_bed_or_N(sv)) {
-      continue;
-    }
+  for (const SV &sv : svs)
     cout << sv << endl;
-  }
 }
 
 void Caller::write_sam() {
@@ -2630,6 +2821,10 @@ void Caller::print_vcf_header() {
        << endl;
   cout << "##INFO=<ID=MATEID,Number=.,Type=String,Description=\"ID of the "
           "record holding the other breakend of this BND junction\">"
+       << endl;
+  cout << "##INFO=<ID=MATEINFERRED,Number=0,Type=Flag,Description=\"BND "
+          "breakend not observed: built as the other side of a junction seen "
+          "from its MATEID record only, whose evidence it carries\">"
        << endl;
   cout << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
        << endl;

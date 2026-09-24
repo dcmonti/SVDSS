@@ -126,7 +126,8 @@ struct Clip {
 // soft clips, so it yields no clip cluster to pool with.
 struct ClipBndCand {
   string chrom;
-  uint p;
+  uint p;              // 0-based clip coordinate, for the BAM lookup
+  uint pos;            // 1-based VCF POS of the breakend (see bnd_pos)
   string alt;          // full breakend ALT, geometry already resolved here
   string refbase;
   string sa_chrom;     // partner locus, for the BAM lookup

@@ -115,10 +115,13 @@ public:
   string sa_reads;
   string rvec;
   // ID of the record holding the other breakend of this junction (BND only).
-  // Filled by Caller::link_bnd_mates() once every record exists; stays empty
-  // when only one side of the junction cleared the gates, which is the honest
-  // state — a dangling MATEID would claim a record that was never written.
+  // Filled by Caller::pair_bnd_mates() on the final list, so it always names a
+  // record that is written. Empty only for a breakend whose partner locus is not
+  // in the reference.
   string mate_id;
+  // This BND was not observed: pair_bnd_mates() built it as the other side of a
+  // junction seen from one breakend only (INFO flag MATEINFERRED).
+  bool mate_inferred = false;
   CallStats stats;
   // VCF FILTER. "PASS" unless a post-call gate demoted it: a flagged record is
   // still written, so the full file stays the ALL callset and `bcftools view -f
