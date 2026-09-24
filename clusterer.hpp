@@ -7,6 +7,7 @@
 #include <set>
 #include <stdlib.h>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <htslib/hts.h>
@@ -173,6 +174,7 @@ private:
 
   // parallelize
   vector<vector<Clip>> _p_clips;
+  vector<vector<ChainJunction>> _p_chain;
   vector<vector<SFS>> _p_extended_sfs;
   vector<vector<vector<bam1_t *>>> bam_entries;
   // Flat list of SFS clusters, in genome order. Was a map keyed on (rs, re)
@@ -187,6 +189,7 @@ public:
 
   vector<Cluster> clusters;
   vector<Clip> clips;
+  vector<ChainJunction> chain_junctions;
 
   void run();
 };

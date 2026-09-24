@@ -124,6 +124,31 @@ struct Clip {
 // The partner side cannot help through the existing reciprocal BND pooling:
 // a 201 bp inserted fragment is *always* a supplementary, never a primary with
 // soft clips, so it yields no clip cluster to pool with.
+// One read's junction between two CONSECUTIVE supplementary segments (neither
+// of them the primary), kept only when an SFS of the read crosses the query
+// boundary between them. Clips are extracted from primary alignments only, and
+// each primary side keeps just the SA adjacent to it, so a junction between two
+// short inserted fragments is otherwise never seen: COLO829 truthset_43 is
+// chr10:58717464-58717662 (199 bp) joined to chr12:72273112-72273294 (183 bp)
+// inside a chr3 locus, and no read has a primary alignment on either piece.
+// The SFS stays the somatic evidence (no SFS, no junction); the SA chain only
+// gives the geometry.
+//
+// Breakends are 1-based. `*_left` is true when the segment lies to the LEFT of
+// the position (the junction is at its last base), i.e. the VCF form "t[p[" /
+// "t]p]" when that side is the record. The pair is stored in canonical order
+// (a <= b by chrom, pos) so reads crossing the junction in either direction
+// aggregate together.
+struct ChainJunction {
+  string ca;
+  uint pa;
+  bool a_left;
+  string cb;
+  uint pb;
+  bool b_left;
+  string name;
+};
+
 struct ClipBndCand {
   string chrom;
   uint p;              // 0-based clip coordinate, for the BAM lookup

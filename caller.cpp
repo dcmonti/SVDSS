@@ -545,6 +545,124 @@ void Caller::run() {
       if (idx) hts_idx_destroy(idx);
       if (bam) hts_close(bam);
     }
+    // Junctions between two supplementary segments (see ChainJunction), which
+    // no clip can represent. Aggregated per breakend pair, gated on the number
+    // of distinct reads, and emitted as ONE breakend: pair_bnd_mates() builds
+    // the mate, or pairs it with the record of the other side if one exists.
+    // The BED/N exclusion and the germline check below apply as to every
+    // clipped call.
+    //
+    // A junction already represented by a call is skipped: 7 of the 9 such
+    // junctions above the gate on COLO829, and 12 of 15 on HG008, are events
+    // called from their other side, several of them as INV/DEL/DUP, where a
+    // BND would be a second record for the same event.
+    if (!C.chain_junctions.empty()) {
+      const uint TOL = 50;       // breakend aggregation, as the SA vote key
+      const long DUP_TOL = 200;  // same event as an existing call
+      struct Agg {
+        string ca, cb;
+        bool a_left, b_left;
+        uint pa0, pb0;
+        vector<uint> pas, pbs;
+        vector<string> names;
+      };
+      vector<Agg> aggs;
+      for (const ChainJunction &j : C.chain_junctions) {
+        Agg *hit = nullptr;
+        // Input is sorted by (ca, a_left, cb, b_left, pa, pb): candidates for a
+        // junction are at the tail, so scan backwards and stop at another key.
+        for (size_t k = aggs.size(); k-- > 0;) {
+          Agg &g = aggs[k];
+          if (g.ca != j.ca || g.a_left != j.a_left || g.cb != j.cb ||
+              g.b_left != j.b_left)
+            break;
+          if (j.pa > g.pa0 + TOL)
+            break;
+          if ((uint)abs((long)j.pb - (long)g.pb0) <= TOL) {
+            hit = &g;
+            break;
+          }
+        }
+        if (!hit) {
+          aggs.push_back({j.ca, j.cb, j.a_left, j.b_left, j.pa, j.pb, {}, {}, {}});
+          hit = &aggs.back();
+        }
+        hit->pas.push_back(j.pa);
+        hit->pbs.push_back(j.pb);
+        hit->names.push_back(j.name);
+      }
+      auto ends_of = [&](const SV &sv, vector<pair<string, long>> &out) {
+        out.clear();
+        out.push_back({sv.chrom, (long)sv.s});
+        if (sv.type == "BND") {
+          string mc;
+          long mp;
+          if (bnd_mate(sv, mc, mp))
+            out.push_back({mc, mp});
+        } else {
+          out.push_back({sv.chrom, (long)sv.e});
+        }
+      };
+      auto near = [&](const vector<pair<string, long>> &ends, const string &c,
+                      long p) {
+        for (const auto &e : ends)
+          if (e.first == c && labs(e.second - p) <= DUP_TOL)
+            return true;
+        return false;
+      };
+      uint emitted = 0, dup = 0, low = 0;
+      vector<SV> chain_svs;
+      vector<pair<string, long>> ends;
+      for (Agg &g : aggs) {
+        sort(g.names.begin(), g.names.end());
+        g.names.erase(unique(g.names.begin(), g.names.end()), g.names.end());
+        if (g.names.size() < config->min_cluster_weight) {
+          ++low;
+          continue;
+        }
+        sort(g.pas.begin(), g.pas.end());
+        sort(g.pbs.begin(), g.pbs.end());
+        const uint pa = g.pas[g.pas.size() / 2];
+        const uint pb = g.pbs[g.pbs.size() / 2];
+        bool is_dup = false;
+        for (const vector<SV> *set : {&svs, &clipped_svs}) {
+          for (const SV &sv : *set) {
+            ends_of(sv, ends);
+            if (near(ends, g.ca, pa) && near(ends, g.cb, pb)) {
+              is_dup = true;
+              break;
+            }
+          }
+          if (is_dup)
+            break;
+        }
+        if (is_dup) {
+          ++dup;
+          spdlog::debug("[CLIP_CHAIN][DUP] {}:{} <-> {}:{} w={}", g.ca, pa,
+                        g.cb, pb, g.names.size());
+          continue;
+        }
+        if (chromosome_seqs.find(g.ca) == chromosome_seqs.end() || pa == 0)
+          continue;
+        const string refbase(chromosome_seqs[g.ca] + pa - 1, 1);
+        // Mate piece to the LEFT of its position ("]p]") or to the right ("[p[").
+        const string br = g.b_left ? "]" : "[";
+        const string m = br + g.cb + ":" + to_string(pb) + br;
+        const string alt = g.a_left ? refbase + m : m + refbase;
+        SV sv("BND", g.ca, pa, refbase, alt, (uint)g.names.size(), 0, 0, 0,
+              true, 0);
+        sv.add_reads(g.names);
+        sv.add_sa_reads(g.names);
+        chain_svs.push_back(sv);
+        ++emitted;
+        spdlog::debug("[CLIP_CHAIN] {}:{} {} w={}", g.ca, pa, alt,
+                      g.names.size());
+      }
+      clipped_svs.insert(clipped_svs.end(), chain_svs.begin(), chain_svs.end());
+      spdlog::info("[CLIP_CHAIN] {} junction groups: {} emitted, {} already "
+                   "called, {} below min_cluster_weight",
+                   aggs.size(), emitted, dup, low);
+    }
     // Deduplicate clipped SVs by reciprocal overlap (RO >= 0.9).
     // Left-clip and right-clip SA paths independently call the same large
     // deletion from opposite breakpoints; RO with max() denominator merges

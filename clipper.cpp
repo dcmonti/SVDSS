@@ -25,6 +25,12 @@ constexpr uint CLIP_BND_RESCUE_MIN_W = 3;
 // rescued candidates separate cleanly on exactly this ratio -- truthset_53 has
 // nsa/w = 6/6, the one false positive 6/20.
 constexpr uint CLIP_BND_RESCUE_MIN_SA_FRAC_INV = 2; // nsa*2 >= w
+// A losing SA group of a clip cluster is emitted as a breakend of its own when
+// it clears min_cluster_weight on its own reads AND holds at least this share
+// (percent) of the winner's count. One BND per cluster lost truthset_7 on
+// COLO829: the chr3 cluster folds the chr3->chr12 junction (11 reads) and the
+// chr3->chr10 junction 457 bp away (21 reads) and only the latter was called.
+constexpr uint MULTI_GROUP_MIN_PCT = 30;
 
 struct SAGroup {
   string sa_chrom;
@@ -45,6 +51,16 @@ struct SAGroup {
   // the median dq, so the emitted SVINSSEQ belongs to a read that actually
   // agrees with the reported SVINSLEN.
   vector<string> ins_seqs;
+  // Clip position of every voter, repeated once per SA-carrying read (the same
+  // weight as `count`). The group's own breakend is the median of these: the
+  // cluster key is only the seed clip, which may be a stray read that lost the
+  // vote (truthset_66 on COLO829: a 1-read chr3 clip 526 bp before the 15-read
+  // junction dictated POS).
+  vector<int> ps;
+  // Names of the SA-carrying reads that voted for this group, so that a losing
+  // group emitted as its own breakend (see MULTI_GROUP_MIN_PCT) carries its own
+  // read support instead of the whole cluster's.
+  vector<string> names;
 };
 
 // Median of a per-read statistic pooled over a cluster. Median rather than
@@ -179,15 +195,23 @@ static void sa_vote_add(vector<SAGroup> &groups, const Clip &c) {
       g.dqs.insert(g.dqs.end(), cdqs.begin(), cdqs.end());
       if (!c.ins_seq.empty())
         g.ins_seqs.push_back(c.ins_seq);
+      g.ps.insert(g.ps.end(), w, (int)c.p);
+      if (!c.sa_names.empty())
+        g.names.insert(g.names.end(), c.sa_names.begin(), c.sa_names.end());
+      else if (!c.name.empty())
+        g.names.push_back(c.name);
       return;
     }
   }
   vector<string> iseqs;
   if (!c.ins_seq.empty())
     iseqs.push_back(c.ins_seq);
+  vector<string> gnames = c.sa_names;
+  if (gnames.empty() && !c.name.empty())
+    gnames.push_back(c.name);
   groups.push_back({c.sa_chrom, c.sa_pos, c.sa_ref_len, c.sa_query_start,
                     c.sa_query_len, c.primary_reverse, c.sa_reverse, w, jc,
-                    cdqs, iseqs});
+                    cdqs, iseqs, vector<int>(w, (int)c.p), gnames});
 }
 
 // Pick the SA group that dictates the cluster's coordinates. `clip_chrom`/
@@ -218,7 +242,12 @@ static bool sa_group_degenerate(const SAGroup &g, const string &clip_chrom,
                                 uint clip_pos) {
   if (g.sa_chrom != clip_chrom)
     return false; // cross-contig: the junction is elsewhere, never degenerate
-  long long dR = (long long)g.junction - (long long)clip_pos;
+  // Measure from the group's own breakend, not the cluster key: the key is the
+  // seed clip, which can belong to another group (a short event folds both of
+  // its junctions into one cluster), and the group is emitted at its median.
+  const long long pos = g.ps.empty() ? (long long)clip_pos
+                                     : (long long)median_int(g.ps);
+  long long dR = (long long)g.junction - pos;
   if (dR < 0)
     dR = -dR;
   const long long m = (long long)Configuration::getInstance()->min_sv_length;
@@ -481,6 +510,7 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r,
   for (auto &kv : by_chrom) {
     map<uint, Clip> clusters_by_pos;
     map<uint, vector<SAGroup>> sa_votes_by_pos;
+    vector<Clip> extras;
     for (const Clip &c : kv.second) {
       bool found = false;
       for (map<uint, Clip>::iterator it = clusters_by_pos.begin();
@@ -527,8 +557,44 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r,
       SAGroup winner;
       int widx = -1;
       const vector<SAGroup> &gs = sa_votes_by_pos[it->first];
-      if (sa_vote_winner(gs, kv.first, it->first, winner, &widx))
+      if (sa_vote_winner(gs, kv.first, it->first, winner, &widx)) {
         apply_sa_winner(it->second, winner, gs);
+        // Move the breakend onto the winning group's own clips. The key stays
+        // the seed (the vote, its degeneracy test and the dump are keyed on
+        // it); only the emitted position changes.
+        if (!winner.ps.empty())
+          it->second.p = (uint)median_int(winner.ps);
+      }
+      // Losing groups strong enough to be a junction of their own. Excluded:
+      // groups describing the winner's own breakend (same SA chrom, same
+      // relative orientation, junction within the cluster radius) -- that is
+      // jitter or the other junction of a short inversion, whose reads already
+      // count towards the winner through sa_total -- and degenerate groups.
+      vector<int> extra_idx;
+      if (widx >= 0) {
+        const uint min_cw = Configuration::getInstance()->min_cluster_weight;
+        const bool w_opp = (winner.primary_reverse != winner.sa_reverse);
+        for (uint gi = 0; gi < gs.size(); ++gi) {
+          const SAGroup &g = gs[gi];
+          if ((int)gi == widx || g.count < min_cw ||
+              g.count * 100 < winner.count * MULTI_GROUP_MIN_PCT ||
+              g.ps.empty() || sa_group_degenerate(g, kv.first, it->first))
+            continue;
+          const long long dj = (long long)g.junction - (long long)winner.junction;
+          if (g.sa_chrom == winner.sa_chrom &&
+              (g.primary_reverse != g.sa_reverse) == w_opp &&
+              (dj < 0 ? -dj : dj) <= (long long)r)
+            continue;
+          Clip extra = it->second;
+          extra.names = g.names;
+          extra.sa_names = g.names;
+          extra.w = g.count;
+          apply_sa_winner(extra, g, vector<SAGroup>{g});
+          extra.p = (uint)median_int(g.ps);
+          extras.push_back(extra);
+          extra_idx.push_back((int)gi);
+        }
+      }
       if (dump && !gs.empty()) {
         // Record every competing group, not just the winner: which group won
         // and by how much is the whole explanation of a breakend's geometry.
@@ -547,13 +613,25 @@ vector<Clip> Clipper::cluster(const vector<Clip> &clips, uint r,
                  to_string(g.junction) + "\t" + to_string(g.count) + "\t" +
                  to_string(median_int(g.dqs)) + "\t" +
                  (sa_group_degenerate(g, kv.first, it->first) ? "DEG" : ".") +
-                 "\t" + ((int)gi == widx ? "WIN" : ".") + "\n";
+                 "\t" +
+                 ((int)gi == widx
+                      ? "WIN"
+                      : (find(extra_idx.begin(), extra_idx.end(), (int)gi) !=
+                                 extra_idx.end()
+                             ? "EXTRA"
+                             : ".")) +
+                 "\t" +
+                 to_string(median_int(g.ps) + 1) + "\n";
         }
 #pragma omp critical(vote_dump)
         vote_dump.push_back(buf);
       }
       clusters.push_back(it->second);
     }
+    if (!extras.empty())
+      spdlog::info("[CLIP_MULTI][{}] {}: {} extra breakends from losing SA groups",
+                   side, kv.first, extras.size());
+    clusters.insert(clusters.end(), extras.begin(), extras.end());
   }
   return clusters;
 }
@@ -683,7 +761,8 @@ void Clipper::store_vote_groups() {
   f << "#SVDSS SA vote groups per clip cluster\n";
   f << "#fields=side\tchrom:cluster_p_1based\tn_groups\tgroup_idx"
        "\tsa_chrom:sa_pos\tsa_ref_len\tsa_query_start\tsa_query_len"
-       "\tstrands\tjunction\tcount\tdq_median\tdegenerate\twinner\n";
+       "\tstrands\tjunction\tcount\tdq_median\tdegenerate\twinner"
+       "\tgroup_p_1based\n";
   for (const string &b : vote_dump)
     f << b;
   f.close();

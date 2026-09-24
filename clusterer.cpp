@@ -2,6 +2,17 @@
 
 namespace {
 
+// Max query gap (or overlap) between two consecutive supplementary segments for
+// their junction to be considered (see ChainJunction). A larger gap hides a
+// piece of the read that is not aligned at all -- a fragment too short for an
+// SA, or one dropped below min_mapq -- so the two segments are not adjacent in
+// the derivative and their junction is composite. On COLO829 the real
+// junctions have gaps of 1 (truthset_43), 11 (truthset_7) and, on HG008, 20 bp
+// (SV_64, 20 inserted bases in the GT); the composite chr6:26194178 <->
+// chr3:26390426 skips the 76 bp chr6:26193813-26193888 with a 77 bp gap, which
+// at 100 was emitted and is in no callset.
+constexpr uint CHAIN_MAX_QGAP = 50;
+
 struct SAEntry {
   string chrom;
   uint pos;       // 1-based (SAM spec)
@@ -85,6 +96,7 @@ void Clusterer::run() {
   // alignments and extending them using unique k-mers
   spdlog::info("Placing SFSs on reference genome");
   _p_clips.resize(config->threads);
+  _p_chain.resize(config->threads);
   _p_extended_sfs.resize(config->threads);
   align_and_extend();
   for (int i = 0; i < config->threads; i++) {
@@ -99,7 +111,19 @@ void Clusterer::run() {
     // reversed the thread order and shifted the whole (fat) Clip vector every
     // time -- ~1.9M element moves for 59k clips.
     clips.insert(clips.end(), _p_clips[i].begin(), _p_clips[i].end());
+    chain_junctions.insert(chain_junctions.end(), _p_chain[i].begin(),
+                           _p_chain[i].end());
   }
+  // Same reason as the clips below: the per-thread concatenation depends on
+  // --threads, and the aggregation downstream is greedy in input order.
+  sort(chain_junctions.begin(), chain_junctions.end(),
+       [](const ChainJunction &a, const ChainJunction &b) {
+         return tie(a.ca, a.a_left, a.cb, a.b_left, a.pa, a.pb, a.name) <
+                tie(b.ca, b.a_left, b.cb, b.b_left, b.pa, b.pb, b.name);
+       });
+  spdlog::info("[CLIP_CHAIN] {} SFS-crossed junctions between supplementary "
+               "segments",
+               chain_junctions.size());
   // Canonical order for the clips, established HERE rather than inside
   // Clipper::call, because the first consumers there are order-sensitive:
   // remove_duplicates() keeps the FIRST clip of each read name, and combine()
@@ -266,6 +290,12 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
   pair<uint, uint> rclip = make_pair(0, 0);
   int last_pos = 0;
   vector<SFS> local_extended_sfs;
+  // SFSs reaching into the clipped part of the read (one or both boundaries
+  // unplaceable on the primary). An SFS entirely inside a soft clip still has a
+  // placed base on the other side of it, so it lands in the lclip/rclip
+  // branches below, not in UNPLACED. Dropped for the primary, but they may
+  // cross a junction between two supplementary segments (see ChainJunction).
+  vector<pair<int, int>> unplaced_sfs;
   // If read is on reverse strand AND SFS coordinates come from FASTA
   // (forward-strand coordinates), invert them and re-sort by qs so that the
   // last_pos optimization works correctly. When SFS come from BAM, htslib
@@ -326,11 +356,15 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       spdlog::debug("[SFS_FILTER][UNPLACED] read={} chrom={} sfs_qs={} "
                     "sfs_len={} (both boundaries missing)",
                     qname, chrom, sfs.qs, sfs.l);
+      if (config->clipped)
+        unplaced_sfs.push_back({s, e});
       // book-keeping only; racy without this (see fill_clusters)
 #pragma omp atomic
       ++unplaced;
       continue;
     } else if (refs == -1) {
+      if (config->clipped)
+        unplaced_sfs.push_back({s, e});
       uint op = bam_cigar_op(*(cigar + 0));
       uint l = bam_cigar_oplen(*(cigar + 0));
       if (op == BAM_CSOFT_CLIP && config->clipped)
@@ -344,6 +378,8 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
       }
       continue; // in any case, we skip this SFS
     } else if (refe == -1) {
+      if (config->clipped)
+        unplaced_sfs.push_back({s, e});
       uint op = bam_cigar_op(*(cigar + aln->core.n_cigar - 1));
       uint l = bam_cigar_oplen(*(cigar + aln->core.n_cigar - 1));
       if (op == BAM_CSOFT_CLIP && config->clipped)
@@ -523,6 +559,65 @@ void Clusterer::extend_alignment(bam1_t *aln, int index) {
     uint flipped_start = (read_len > sa_end) ? (read_len - sa_end) : 0;
     return {flipped_start, flipped_end};
   };
+
+  // Junctions between consecutive supplementary segments crossed by an SFS.
+  // All spans are in the primary's frame (sa_qspan_in_primary; the SFS were
+  // moved into it above), where the primary is forward and an SA is reversed
+  // iff its strand differs from the primary's.
+  if (config->clipped && sa_entries.size() >= 2 && !unplaced_sfs.empty()) {
+    struct Seg {
+      uint qs, qe;
+      const SAEntry *sa;
+    };
+    vector<Seg> segs;
+    for (const SAEntry &sa : sa_entries) {
+      auto span = sa_qspan_in_primary(sa);
+      segs.push_back({span.first, span.second, &sa});
+    }
+    // The primary takes part only as a separator: a junction touching it is a
+    // clip, already handled below.
+    segs.push_back({primary_q_start, primary_q_end, nullptr});
+    sort(segs.begin(), segs.end(),
+         [](const Seg &a, const Seg &b) { return a.qs < b.qs; });
+    for (size_t k = 0; k + 1 < segs.size(); ++k) {
+      const Seg &a = segs[k];
+      const Seg &b = segs[k + 1];
+      if (a.sa == nullptr || b.sa == nullptr)
+        continue;
+      const uint lo = min(a.qe, b.qs), hi = max(a.qe, b.qs);
+      if (hi - lo > CHAIN_MAX_QGAP)
+        continue;
+      bool crossed = false;
+      for (const auto &u : unplaced_sfs)
+        if (u.first <= (int)hi && u.second + 1 >= (int)lo) {
+          crossed = true;
+          break;
+        }
+      if (!crossed)
+        continue;
+      // Leaving `a` and entering `b` along the read. A forward segment is left
+      // at its last base (segment to the left of it) and entered at its first;
+      // a reversed one the other way round.
+      const bool a_rev = a.sa->reverse != primary_reverse;
+      const bool b_rev = b.sa->reverse != primary_reverse;
+      const uint a_last = a.sa->pos + a.sa->ref_len - 1;
+      const uint b_last = b.sa->pos + b.sa->ref_len - 1;
+      ChainJunction j;
+      j.ca = a.sa->chrom;
+      j.pa = a_rev ? a.sa->pos : a_last;
+      j.a_left = !a_rev;
+      j.cb = b.sa->chrom;
+      j.pb = b_rev ? b_last : b.sa->pos;
+      j.b_left = b_rev;
+      if (tie(j.cb, j.pb) < tie(j.ca, j.pa)) {
+        swap(j.ca, j.cb);
+        swap(j.pa, j.pb);
+        swap(j.a_left, j.b_left);
+      }
+      j.name = qname;
+      _p_chain[index].push_back(std::move(j));
+    }
+  }
 
   // Fill in this read's junction geometry: dq (inner unaligned query bases) and,
   // when dq > 0, the inserted bases themselves.
