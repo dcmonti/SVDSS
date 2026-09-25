@@ -13,7 +13,7 @@
 
 using namespace std;
 
-const string version = "v2.1.0";
+const string version = "v1.0.0-somatic (based on SVDSS v2.1.0)";
 
 int main(int argc, char **argv) {
   time_t t;

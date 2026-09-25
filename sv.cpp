@@ -33,7 +33,7 @@ SV::SV(const string type_, const string &chrom_, uint s_, const string &refall_,
   cigar = cigar_;
   idx = type + "_" + chrom + ":" + to_string(s) + "-" + to_string(e);
   idx += "_" + to_string(abs(l));
-  gt = "./.";
+  gt = "0/1"; // somatic calls: heterozygous by default (as upstream 40181be)
   rvec = "";
 }
 

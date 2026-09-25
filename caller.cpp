@@ -1864,8 +1864,10 @@ void Caller::merge_fragmented_dels(vector<SV> &recs) {
     }
     const uint start = recs[i].s;
     const uint span = recs[last].e - start;
+    // REF = padding base at POS + the span deleted bases (span + 1), as in
+    // upstream eb4dcb1; END = POS + span follows from it (SV::SV).
     SV sv = SV("DEL", recs[i].chrom, start,
-               string(chromosome_seqs[recs[i].chrom] + start - 1, span),
+               string(chromosome_seqs[recs[i].chrom] + start - 1, span + 1),
                string(chromosome_seqs[recs[i].chrom] + start - 1, 1), recs[i].w,
                recs[i].cov, recs[i].ngaps, recs[i].score, recs[i].imprecise,
                span, recs[i].cigar);
@@ -2575,8 +2577,9 @@ void Caller::pcall(const vector<Cluster> &clusters) {
         }
         const uint start = del_ops[d].rpos;
         const uint span = del_ops[last].rpos + del_ops[last].len - start;
+        // REF = padding base + span deleted bases (upstream eb4dcb1)
         SV sv = SV("DEL", cl.chrom, start,
-                   string(chromosome_seqs[chrom] + start - 1, span),
+                   string(chromosome_seqs[chrom] + start - 1, span + 1),
                    string(chromosome_seqs[chrom] + start - 1, 1), allele_w,
                    cl.cov, nv, score, false, span, cigar_str);
         if (last > d) {
@@ -2601,7 +2604,7 @@ void Caller::pcall(const vector<Cluster> &clusters) {
       }
       for (size_t v = 0; v < _svs.size(); v++) {
         _svs[v].ngaps = nv;
-        _svs[v].set_gt("./.", 100);
+        _svs[v].set_gt("0/1", 100);
         _svs[v].set_cov(cl.cov, cl.cov0, cl.cov1, cl.cov2);
         _svs[v].set_rvec(cluster.reads);
       }
